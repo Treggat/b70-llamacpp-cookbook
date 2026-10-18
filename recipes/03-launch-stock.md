@@ -19,8 +19,8 @@ llama-server \
 ## Prefill
 
 - **`-b 4096 -ub 2048`.** The biggest prefill lever: bigger matmuls per launch. It did not help every model
-  equally (+22% on one seat, +8% on another), and the compute buffer grows with `-ub`, so on a seat near the
-  VRAM limit it caused 502s. Check your headroom.
+  equally (+22% on one model, +8% on another), and the compute buffer grows with `-ub`, so on a server already near the
+  VRAM limit, requests failed with HTTP 502. Check your headroom.
 - **`-fa on`.** Leave flash attention on.
 - **`-np 1 --kv-unified`.** One slot, so the whole batch goes to one sequence and the KV cache is not split
   across idle slots.

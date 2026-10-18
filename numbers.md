@@ -2,7 +2,7 @@
 
 One Arc Pro B70 (32 GB), Qwen3.8-27B (Fable 709-L) Q4_K_M with MTP heads, BF16 mmproj, f16 target KV, 131k
 context, `-np 1`. Decode numbers marked "real traffic" come from an agent running a fixed coding task against
-the seat, with the conversation at 30-75k tokens of context.
+the server, with the conversation at 30-75k tokens of context.
 
 ## Tier A (upstream b11095 + 3 patches)
 
@@ -18,8 +18,10 @@ the seat, with the conversation at 30-75k tokens of context.
 
 ## Tier B step by step
 
-Each row is a control-vs-candidate A/B on the same workload, back to back, and was promoted to production
-before the next row was tried. Decode is real traffic at 30-75k depth.
+Each row is a control-vs-candidate A/B on the same workload, back to back, and the candidate went to
+production before the next row was tried. Decode is real traffic at 30-75k depth. Rows ran on different days
+with different conversations, so a row's control can sit below the previous row's candidate; compare within a
+row.
 
 | step | control | candidate |
 |---|---|---|

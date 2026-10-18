@@ -1,8 +1,10 @@
 # 4. Launch, Tier B (the full XMX build)
 
-This is the exact command the production seat ran on the full Tier B build with the oneAPI 2026.1 runtime.
-Every feature the patches add is **off by default** and turned on by an environment variable, so the
-same binary with no variables behaves like Tier A.
+This is the exact command our production server ran on the full Tier B build with the oneAPI 2026.1 runtime.
+Most of what patches `0010`-`0027` add is **off by default** and turned on by an environment variable. With
+no variables set the binary still differs from Tier A: the MMVQ fusions, GQA padding and Q6_K paths from
+patches `0005`-`0007` and the bug fixes in later patches are always on, and patch `0004` adds the
+`--spec-draft-sampling probabilistic` option.
 
 ```bash
 export GGML_SYCL_ENABLE_GRAPH=1 GGML_SYCL_GRAPH_MAX_TOKENS=8 GGML_SYCL_GRAPH_ROT_ROWS=1 \
@@ -48,9 +50,9 @@ llama-server \
 | Prompt cache | `PCACHE_POOL`, `PCACHE_CKPT_MOVE`, `CKPT_POOL`, `KV_CKPT_PARTIAL_SKIP` | cheaper conversation switches: pooled save/restore instead of fresh zero-filled allocations |
 | Determinism | `DNN_DETERMINISTIC` | forces oneDNN's deterministic GEMM (see below) |
 
-Each switch landed after a same-workload A/B on the seat; the per-commit gains are in
+Each switch went in after a same-workload A/B against the previous build; the gains are in
 [`numbers.md`](../numbers.md#tier-b-step-by-step). The message at the top of each file in [`patches/`](../patches/)
-describes what that patch adds and which switch turns it on.
+describes what that patch adds and names its switches.
 
 ## The model file
 

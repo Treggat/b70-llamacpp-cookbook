@@ -6,9 +6,9 @@
   a phone photo, ~8.1k for 4K. Image tokens prefill about 2.4x slower per token than text; that is the price
   of the detail. With patch 0002, `--cache-ram` makes re-sends nearly free.
 - **Send video as an `image_url` part** with `data:video/mp4;base64,...`. A `video_url` part returns HTTP 400.
-- **The client must budget frames.** The seat samples at `--video-fps` (default 4) and does not cap the frame
+- **The client must budget frames.** `llama-server` samples at `--video-fps` (default 4) and does not cap the frame
   count. Cost is roughly `frames / 2 x 1024` tokens.
-- **Control frame count without touching the seat** by re-timing the clip:
+- **Control frame count without restarting the server** by re-timing the clip:
 
   ```bash
   ffmpeg -i in.mp4 -vf "fps=S,setpts=(S/4)*PTS" -r 4 out.mp4   # S = targetFrames / duration

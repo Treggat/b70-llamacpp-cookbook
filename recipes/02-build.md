@@ -62,7 +62,8 @@ cmake --build build-sycl --config Release
 ```
 
 `-DGGML_SYCL_XMX=ON` also builds the register-fed DPAS kernels as their own library
-(`libggml-sycl-xmxd.so`); ship it next to `libggml-sycl.so`.
+(`libggml-sycl-xmxd.so`); ship it next to `libggml-sycl.so`. Run Tier B with the oneAPI **2026.1** runtime
+libraries on `LD_LIBRARY_PATH`.
 
 ## Tips
 

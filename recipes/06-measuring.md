@@ -11,7 +11,7 @@
 - **Measure decode at the depth you actually use.** Ours drops from ~42 t/s shallow to ~36 t/s at 40k on
   Tier A. All Tier B decode numbers here are at 30-75k depth.
 - **Use real traffic for the final A/B.** Synthetic prompts gave different draft acceptance than an agent
-  writing code. Our deciding test was a fixed coding task run by an agent against the seat, control and
+  writing code. Our deciding test was a fixed coding task run by an agent against the server, control and
   candidate back to back, reporting decode t/s, ms per step, tokens per step and acceptance.
 - **Variance is 5-13% run to run.** Treat differences under 5% as noise; repeat before you believe them.
 - **Do not run `llama-bench` while the server can reload the model.** Two collisions caused GPU engine resets.
