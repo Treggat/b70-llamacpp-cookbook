@@ -42,8 +42,23 @@ that did not help.
 
 ## Status
 
-Finished, October 2026. We moved our main server to vLLM, so neither tier gets new work. Upstream has moved on;
+Finished, October 2026. We moved our main server to vLLM ([B70-Vllm-Cookbook](https://github.com/Treggat/B70-Vllm-Cookbook)),
+so neither tier gets new work. Upstream has moved on;
 if you port the patches to a newer tag, expect conflicts in `ggml-sycl` and `tools/server`.
+
+## Credits
+
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (ggml-org and its contributors): everything here is a patch on top of it.
+- **[praneshgo](https://github.com/praneshgo)**: patch `0004` is a cherry-pick of their probabilistic drafter,
+  upstream PR [#27694](https://github.com/ggml-org/llama.cpp/pull/27694).
+- **Anant Shrivastava**: patch `0005` is a cherry-pick of their SYCL MMVQ fusion work, upstream PR
+  [#28931](https://github.com/ggml-org/llama.cpp/pull/28931).
+- **[DavidAU](https://huggingface.co/DavidAU)** for the
+  [Qwen3.8-27B 709-L merge](https://huggingface.co/DavidAU/Qwen3.8-27B-TWIN-TURBO-Fable-Cold-Fusion-709-L-Uncensored-NM-DAU-NEO-MTP-GGUF)
+  the numbers were measured on.
+- **Claude** (Anthropic; Claude Opus 5.5 and Claude Fable 5.1, through Claude Code): co-wrote the patches and kernels,
+  ran the A/B measurements and helped write this cookbook. Each patch says which model assisted in its
+  `Assisted-by:` line.
 
 ## Licence
 
