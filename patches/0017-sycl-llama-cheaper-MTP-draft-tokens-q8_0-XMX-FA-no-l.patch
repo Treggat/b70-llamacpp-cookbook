@@ -1,0 +1,1267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Sun, 27 Sep 2026 20:39:32 -0600
+Subject: [PATCH 17/27] sycl/llama : cheaper MTP draft tokens (q8_0 XMX FA, no
+ logit pad, fast balloc)
+
+- GGML_SYCL_XMX_FA_Q8: XMX flash attention reading q8_0 K/V (1-8+
+  queries, D=256), used for the MTP draft context via -ctkd/-ctvd q8_0
+- GGML_SYCL_XMX_FA_DRAFT_N1: f16 XMX attention at 1 query for the draft
+  context only
+- LLAMA_MTP_DRAFT_NOPAD: keep draft logits at draft-head width
+- LLAMA_BALLOC_FAST: skip the per-decode coupled-sequence scan
+- scripts/b70/gguf_draft_head_trim.py: trimmed draft-head variants
+All default off; target outputs unchanged by the draft-only switches.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-backend.cpp           |  43 +++
+ ggml/src/ggml-sycl/fattn-xmx.cpp    | 344 +++++++++++++++++++++-
+ ggml/src/ggml-sycl/fattn-xmx.hpp    |   4 +
+ ggml/src/ggml-sycl/ggml-sycl.cpp    |   1 +
+ scripts/b70/gguf_draft_head_trim.py |  48 ++++
+ src/llama-batch.cpp                 |  23 +-
+ src/llama-context.cpp               |  18 +-
+ src/llama-graph.cpp                 |   6 +
+ src/models/qwen35.cpp               |   9 +-
+ tests/CMakeLists.txt                |   2 +
+ tests/test-backend-ops.cpp          |  53 ++++
+ tests/test-draftcost-host.cpp       | 431 ++++++++++++++++++++++++++++
+ 12 files changed, 970 insertions(+), 12 deletions(-)
+ create mode 100644 scripts/b70/gguf_draft_head_trim.py
+ create mode 100644 tests/test-draftcost-host.cpp
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 408b60a20b..67f519c377 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1772,6 +1772,32 @@ static void ggml_sched_stage_commit(ggml_backend_sched_t sched, int backend_id,
+     }
+ }
+ 
++// [draftcost] GGML_SCHED_PROF=1 (LOCAL, default off): host time of the input uploads and of the backend
++// graph_compute_async call per split, for decode-size splits (all staged inputs < 1 MiB); printed at exit
++struct ggml_sched_prof_acc { int64_t n = 0, n_in = 0; double inputs_ms = 0, compute_ms = 0; };
++static ggml_sched_prof_acc g_sched_prof[2];
++static void ggml_sched_prof_print() {
++    const char * nm[2] = { "decode-size", "large" };
++    for (int i = 0; i < 2; ++i) {
++        const auto & a = g_sched_prof[i];
++        if (a.n) {
++            fprintf(stderr, "[sched-prof] %-11s splits=%8lld avg inputs=%.1f upload=%.4f ms compute_async=%.4f ms\n",
++                    nm[i], (long long) a.n, (double) a.n_in / a.n, a.inputs_ms / a.n, a.compute_ms / a.n);
++        }
++    }
++}
++static bool ggml_sched_prof_on() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_SCHED_PROF");
++        const bool v = e && atoi(e) != 0;
++        if (v) {
++            atexit(ggml_sched_prof_print);
++        }
++        return v;
++    }();
++    return on;
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1797,6 +1823,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        const bool    sp_on = ggml_sched_prof_on();
++        const int64_t sp_t0 = sp_on ? ggml_time_us() : 0;
++        size_t        sp_bytes = 0;
++        if (sp_on) {
++            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
++                sp_bytes += ggml_nbytes(split->inputs[input_id]);
++            }
++        }
++
+         // [spechost] GGML_SYCL_ASYNC_INPUTS: reserve one staging region for all user inputs of this split
+         size_t st_beg = SIZE_MAX, st_off = 0;
+         if (ggml_sched_async_inputs_env()) {
+@@ -1952,7 +1987,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+ 
+         if (!sched->callback_eval) {
++            const int64_t sp_t1 = sp_on ? ggml_time_us() : 0;
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++            if (sp_on) {
++                auto & a = g_sched_prof[sp_bytes < (1u << 20) ? 0 : 1];
++                a.n++;
++                a.n_in       += split->n_inputs;
++                a.inputs_ms  += (sp_t1 - sp_t0) / 1000.0;
++                a.compute_ms += (ggml_time_us() - sp_t1) / 1000.0;
++            }
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
+diff --git a/ggml/src/ggml-sycl/fattn-xmx.cpp b/ggml/src/ggml-sycl/fattn-xmx.cpp
+index 83353cffa3..73630c1af6 100644
+--- a/ggml/src/ggml-sycl/fattn-xmx.cpp
++++ b/ggml/src/ggml-sycl/fattn-xmx.cpp
+@@ -28,6 +28,13 @@ bool ggml_sycl_fattn_xmx_env() {
+     return v;
+ }
+ 
++// GGML_SYCL_XMX_FA_Q8=1 (LOCAL, default off): the XMX decode/verify kernel for a q8_0 KV cache (-ctk q8_0 -ctv q8_0).
++// Independent of GGML_SYCL_XMX_FA (which gates the f16 kernel); without it a q8_0 cache runs on the TILE kernel.
++bool ggml_sycl_fattn_xmx_q8_env() {
++    static const bool v = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_Q8", 0) != 0;
++    return v;
++}
++
+ // kernel geometry (xmx_fa.cpp): 8 sub-groups of 16 lanes, 8 tokens per sub-group per iteration
+ static constexpr int XFA_D    = 256;             // head dim, K and V
+ static constexpr int XFA_SG   = 16;
+@@ -50,13 +57,31 @@ static int ggml_sycl_fattn_xmx_max_cols() {
+     return v;
+ }
+ 
++// GGML_SYCL_XMX_FA_DRAFT_N1=1 (LOCAL, default off): run the f16 XMX kernel at 1 query token too, but only for an MTP
++// draft context's attention (tagged by llama-graph in op_params[15]); the target's 1-token decodes stay on TILE, so
++// target outputs are unchanged. Measured 471 vs 494 us (TILE) per draft token at kv 65536, 587 vs 609 at 81920.
++static bool ggml_sycl_fattn_xmx_draft_n1() {
++    static const bool v = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_DRAFT_N1", 0) != 0;
++    return v;
++}
++
++static bool ggml_sycl_fattn_is_mtp_draft(const ggml_tensor * dst) {
++    return dst->op_params[15] == 0x4D545044;
++}
++
++static int ggml_sycl_fattn_xmx_q8_min_cols() {
++    // default 1: the q8_0 kernel beats TILE on q8_0 at 1 token too (TILE dequantizes the whole cache to f16 first)
++    static const int v = std::max(1, ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_Q8_MIN_COLS", 1));
++    return v;
++}
++
+ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
+ #if !GGML_SYCL_XMX
+     GGML_UNUSED(device);
+     GGML_UNUSED(dst);
+     return false;
+ #else
+-    if (!ggml_sycl_fattn_xmx_env() || dst->op != GGML_OP_FLASH_ATTN_EXT) {
++    if (dst->op != GGML_OP_FLASH_ATTN_EXT) {
+         return false;
+     }
+     const ggml_tensor * Q     = dst->src[0];
+@@ -67,7 +92,11 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
+     if (!Q || !K || !V || !mask || sinks) {
+         return false;
+     }
+-    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
++    const bool q8 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
++    if (q8 ? !ggml_sycl_fattn_xmx_q8_env() : !ggml_sycl_fattn_xmx_env()) {
++        return false;
++    }
++    if (Q->type != GGML_TYPE_F32 || (!q8 && (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16)) ||
+         mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
+         return false;
+     }
+@@ -86,7 +115,9 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
+     }
+     const int64_t nb = Q->ne[1];
+     const int64_t kv = K->ne[1];
+-    if (nb < ggml_sycl_fattn_xmx_min_cols() || nb > ggml_sycl_fattn_xmx_max_cols()) {
++    const int min_cols = q8 ? ggml_sycl_fattn_xmx_q8_min_cols()
++                            : (ggml_sycl_fattn_xmx_draft_n1() && ggml_sycl_fattn_is_mtp_draft(dst)) ? 1 : ggml_sycl_fattn_xmx_min_cols();
++    if (nb < min_cols || nb > ggml_sycl_fattn_xmx_max_cols()) {
+         return false;
+     }
+     if (K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || V->ne[1] != kv) {
+@@ -103,7 +134,9 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
+         return false;
+     }
+     // element-contiguous rows; the K/V row loads are 2D block loads from global: 64 B aligned base and pitches
+-    if (Q->nb[0] != sizeof(float) || K->nb[0] != sizeof(sycl::half) || V->nb[0] != sizeof(sycl::half) ||
++    // (q8_0: 2D int8 block loads at 4-byte aligned starts, pitch a multiple of 16 B, >= 64 B; blocks contiguous)
++    const size_t kv_elt = q8 ? ggml_type_size(GGML_TYPE_Q8_0) : sizeof(sycl::half);
++    if (Q->nb[0] != sizeof(float) || K->nb[0] != kv_elt || V->nb[0] != kv_elt ||
+         mask->nb[0] != sizeof(sycl::half) || dst->nb[0] != sizeof(float)) {
+         return false;
+     }
+@@ -112,7 +145,11 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
+         return false;
+     }
+     for (const ggml_tensor * t : { K, V }) {
+-        if (t->nb[1] % 64 != 0 || t->nb[2] % 64 != 0 || ((uintptr_t) t->data) % 64 != 0) {
++        if (q8) {
++            if (t->nb[1] % 16 != 0 || t->nb[1] < 64 || t->nb[2] % 4 != 0 || ((uintptr_t) t->data) % 16 != 0) {
++                return false;
++            }
++        } else if (t->nb[1] % 64 != 0 || t->nb[2] % 64 != 0 || ((uintptr_t) t->data) % 64 != 0) {
+             return false;
+         }
+     }
+@@ -183,6 +220,8 @@ struct xfa_params {
+     int chunk, nchunks;
+     float scale;
+     int qs, Rw;                 // query-row splits per (KV head, chunk) and rows per split (R = qs * Rw)
++    const uint8_t * K8; const uint8_t * V8;   // q8_0 kernel: K / V
++    int64_t k8_s1, k8_s2, v8_s1, v8_s2;       // q8_0 kernel: K / V strides (bytes): token, head
+ };
+ 
+ // One work-group of NSG sub-groups per (KV head, KV chunk, query split). Per iteration of T = 64 tokens:
+@@ -465,6 +504,280 @@ void xfa_run(sycl::queue & q, const xfa_params & p) {
+     }
+ }
+ 
++// ---- q8_0 K/V (GGML_SYCL_XMX_FA_Q8=1) ----
++// Same structure, launch policy (FA_V2) and combine as the f16 kernel above; K and V are read as q8_0 blocks
++// (34 B: f16 scale + 32 x int8) with 2D int8 block loads and dequantized in registers:
++//   1. S^T = K Q^T: per q8_0 block b the 8 tokens x 32 quants are one int8 A tile (a 2D block load; these need a
++//      4-byte aligned start: odd blocks are loaded at their quants (34b+2), even blocks at their scale (34b) plus a
++//      second tile for the last two quants), converted to two f16 A tiles (8 tok x 16 d; the d order inside a block
++//      is permuted so the conversion stays inside each work-item, Q^T is staged in the same order) and scaled by the
++//      per-token block scale.
++//   2. online softmax, as above.
++//   3. O += P V for the sub-group's 32 dv (= q8_0 block s of each token): int8 B tiles (32 tok x 16 quants) -> f16
++//      B tiles (16 tok x 16 dv, per-token scale); the dv order is permuted the same way and undone when O is stored.
++// joint_matrix element maps (probed on the B70): f16 A 8x16 / B 16x16: element e = row e; int8 A 8x32: element 2r+j =
++// (row r, col 2c+j); int8 B 32x16: element e = row e. Column-dependent choices use the apply coordinates.
++static constexpr int XFA_QB = 34;   // q8_0 block bytes
++// quant index held by column c of the f16 tile h (0/1) built from an int8 tile loaded at the 4-byte aligned start:
++// odd block: tile starts at the quants -> 2c + h; even block: tile starts at the scale -> 2(c-1) + h, column 0 takes
++// quants 30/31 from the second tile
++static inline int xfa_q8_kperm(int b, int c, int h) { return (b & 1) ? 2 * c + h : 2 * ((c + 15) & 15) + h; }
++// dv (within the sub-group's block) of column c of f16 B tile nv: odd s -> 16 nv + c; even s -> nv 0: c - 2 (c >= 2)
++// or 30 + c (c < 2), nv 1: 14 + c
++static inline int xfa_q8_vperm(int s, int nv, int c) { return (s & 1) ? 16 * nv + c : (nv ? 14 + c : (c >= 2 ? c - 2 : 30 + c)); }
++
++template <int MT8, int NT16>
++void xfa_launch_main_q8(sycl::queue & q, const xfa_params p) {
++    constexpr int NSG = XFA_NSG, SG = XFA_SG, TPS = XFA_TPS, T = XFA_T, D = XFA_D, DVS = XFA_DVS, QB = XFA_QB;
++    constexpr int R16 = NT16 * 16, R8 = MT8 * 8;
++    constexpr int SST = R16 + 4;
++    constexpr int RPS = (R8 + NSG - 1) / NSG;
++    const int ngroups = p.nhkv * p.nchunks * p.qs;
++    q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<half, 1>  Qp(sycl::range<1>(R16 * D), h);
++        sycl::local_accessor<float, 1> St(sycl::range<1>(T * SST), h);
++        sycl::local_accessor<half, 1>  Ps(sycl::range<1>(R8 * T), h);
++        sycl::local_accessor<float, 1> Al(sycl::range<1>(R8), h);
++        sycl::local_accessor<float, 1> Mr(sycl::range<1>(R8), h);
++        sycl::local_accessor<float, 1> Lr(sycl::range<1>(R8), h);
++        h.parallel_for(sycl::nd_range<1>((size_t) ngroups * NSG * SG, NSG * SG),
++            oexp::properties{ sycl::ext::intel::experimental::grf_size<256> },
++            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            auto sg = it.get_sub_group();
++            const int s     = sg.get_group_linear_id();
++            const int lane  = sg.get_local_linear_id();
++            const int tid   = it.get_local_linear_id();
++            const int g     = it.get_group_linear_id();
++            const int split = g % p.qs;
++            const int gh    = g / p.qs;
++            const int hk    = gh % p.nhkv;
++            const int ch    = gh / p.nhkv;
++            const int rbase = split * p.Rw;
++            const int c0    = ch * p.chunk;
++            const int c1    = sycl::min(p.kv, c0 + p.chunk);
++            const float LOG2E = 1.4426950408889634f;
++
++            half  * qp = Qp.get_multi_ptr<decorated::no>().get();
++            float * st = St.get_multi_ptr<decorated::no>().get();
++            half  * ps = Ps.get_multi_ptr<decorated::no>().get();
++            float * al = Al.get_multi_ptr<decorated::no>().get();
++            float * mr = Mr.get_multi_ptr<decorated::no>().get();
++            float * lr = Lr.get_multi_ptr<decorated::no>().get();
++
++            // ---- stage Q^T (scaled, f16, VNNI packed), d permuted per 16-row tile kk = 2b + h ----
++            for (int i = tid; i < R16 * D; i += NSG * SG) {
++                const int r = i / D, k = i % D;                    // k: packed row (tile kk = k / 16, row k % 16)
++                const int kk = k >> 4, b = kk >> 1, hh = kk & 1;
++                const int d = 32 * b + xfa_q8_kperm(b, k & 15, hh);
++                float v = 0.f;
++                if (r < p.Rw) {
++                    const int rg = rbase + r;
++                    const int t = rg / p.ratio, hq = hk * p.ratio + rg % p.ratio;
++                    v = p.Q[t * p.q_s1 + hq * p.q_s2 + d] * p.scale;
++                }
++                qp[(k >> 1) * (2 * R16) + 2 * r + (k & 1)] = (half) v;
++            }
++            for (int r = tid; r < R8; r += NSG * SG) { mr[r] = -1e30f; lr[r] = 0.f; }
++
++            mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, 8, 16> O[MT8][2];
++#pragma unroll
++            for (int mt = 0; mt < MT8; ++mt)
++#pragma unroll
++                for (int nv = 0; nv < 2; ++nv) mx::joint_matrix_fill(sg, O[mt][nv], 0.f);
++
++            const uint8_t * Kh = p.K8 + hk * p.k8_s2;
++            const uint8_t * Vh = p.V8 + hk * p.v8_s2 + QB * s;       // this sub-group's block (dv 32 s .. 32 s + 31)
++            const bool sodd = (s & 1) != 0;
++            auto lQp = sycl::address_space_cast<address_space::local_space, decorated::no>(qp);
++            auto lSt = sycl::address_space_cast<address_space::local_space, decorated::no>(st);
++            auto lPs = sycl::address_space_cast<address_space::local_space, decorated::no>(ps);
++            auto gload = [](const uint8_t * ptr) {
++                return sycl::address_space_cast<address_space::global_space, decorated::no>((const int8_t *) ptr);
++            };
++
++            sycl::group_barrier(it.get_group());
++
++            for (int tok0 = c0; tok0 < c1; tok0 += T) {
++                // ---- 1. S^T = K Q^T for this sub-group's 8 tokens ----
++                {
++                    const uint8_t * kb = Kh + (int64_t) (tok0 + s * TPS) * p.k8_s1;
++                    // block scales: lane l -> token l & 7, block 2j + (l >> 3); broadcast by shuffles below
++                    uint32_t ksc[4];
++#pragma unroll
++                    for (int j = 0; j < 4; ++j)
++                        ksc[j] = *(const uint16_t *) (kb + (lane & 7) * p.k8_s1 + QB * (2 * j + (lane >> 3)));
++                    mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, 8, 16> S[NT16];
++#pragma unroll
++                    for (int nt = 0; nt < NT16; ++nt) mx::joint_matrix_fill(sg, S[nt], 0.f);
++#pragma unroll
++                    for (int b = 0; b < 8; ++b) {
++                        mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, 8, 32, mx::layout::row_major> K8a, K8b;
++                        mx::joint_matrix_load(sg, K8a, gload(kb + QB * b + ((b & 1) ? 2 : 0)), p.k8_s1);
++                        int8_t ka[16], kz[16];
++                        int e = 0;
++                        imx::joint_matrix_apply(sg, K8a, [&](int8_t & v, size_t, size_t) { ka[e++] = v; });
++                        if (!(b & 1)) {
++                            mx::joint_matrix_load(sg, K8b, gload(kb + QB * b + 32), p.k8_s1);
++                            e = 0;
++                            imx::joint_matrix_apply(sg, K8b, [&](int8_t & v, size_t, size_t) { kz[e++] = v; });
++                        }
++                        half dks[8];
++#pragma unroll
++                        for (int r = 0; r < 8; ++r) {
++                            const int idx = r + 8 * (b & 1);   // lane holding (token r, block b) in ksc[b >> 1]
++                            dks[r] = sycl::bit_cast<half>((uint16_t) sycl::select_from_group(sg, ksc[b >> 1], idx));
++                        }
++#pragma unroll
++                        for (int hh = 0; hh < 2; ++hh) {
++                            const int kk = 2 * b + hh;
++                            mx::joint_matrix<sycl::sub_group, half, mx::use::a, 8, 16, mx::layout::row_major> A;
++                            mx::joint_matrix_fill(sg, A, (half) 0.f);
++                            e = 0;
++                            imx::joint_matrix_apply(sg, A, [&](half & x, size_t, size_t c) {
++                                const int8_t qv = (!(b & 1) && c == 0) ? kz[2 * e + hh] : ka[2 * e + hh];
++                                x = (half) qv * dks[e];
++                                ++e;
++                            });
++#pragma unroll
++                            for (int nt = 0; nt < NT16; ++nt) {
++                                mx::joint_matrix<sycl::sub_group, half, mx::use::b, 16, 16, mx::layout::ext_intel_packed> B;
++                                mx::joint_matrix_load(sg, B, lQp + kk * 8 * (2 * R16) + nt * 32, 2 * R16);
++                                mx::joint_matrix_mad(sg, S[nt], A, B, S[nt]);
++                            }
++                        }
++                    }
++#pragma unroll
++                    for (int nt = 0; nt < NT16; ++nt)
++                        mx::joint_matrix_store(sg, S[nt], lSt + (s * TPS) * SST + nt * 16, SST, mx::layout::row_major);
++                }
++                sycl::group_barrier(it.get_group());
++
++                // ---- 2. online softmax ----
++#pragma unroll
++                for (int ri = 0; ri < RPS; ++ri) {
++                    const int r = s + ri * NSG;
++                    if (r >= R8) continue;
++                    if (r >= p.Rw) {
++                        for (int j = lane; j < T; j += SG) ps[r * T + j] = (half) 0.f;
++                        if (lane == 0) al[r] = 1.f;
++                        continue;
++                    }
++                    const int tq = (rbase + r) / p.ratio;
++                    float x[T / SG];
++                    float mx_ = -INFINITY;
++#pragma unroll
++                    for (int i = 0; i < T / SG; ++i) {
++                        const int j = lane + i * SG;
++                        x[i] = (st[j * SST + r] + (float) p.mask[tq * p.m_s1 + tok0 + j]) * LOG2E;
++                        mx_ = sycl::fmax(mx_, x[i]);
++                    }
++                    mx_ = sycl::reduce_over_group(sg, mx_, sycl::maximum<float>());
++                    const float m_old = mr[r];
++                    const float m_new = sycl::fmax(m_old, mx_);
++                    float sum = 0.f;
++#pragma unroll
++                    for (int i = 0; i < T / SG; ++i) {
++                        const float pe = sycl::exp2(x[i] - m_new);
++                        sum += pe;
++                        ps[r * T + lane + i * SG] = (half) pe;
++                    }
++                    sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
++                    if (lane == 0) {
++                        const float a = sycl::exp2(m_old - m_new);
++                        al[r] = a;
++                        mr[r] = m_new;
++                        lr[r] = lr[r] * a + sum;
++                    }
++                }
++                sycl::group_barrier(it.get_group());
++
++                // ---- 3. O = O*alpha + P V for this sub-group's block s ----
++#pragma unroll
++                for (int mt = 0; mt < MT8; ++mt) {
++                    float a[8];
++                    bool any = false;
++#pragma unroll
++                    for (int i = 0; i < 8; ++i) { a[i] = al[mt * 8 + i]; any |= a[i] != 1.f; }
++                    if (any) {
++#pragma unroll
++                        for (int nv = 0; nv < 2; ++nv)
++                            imx::joint_matrix_apply(sg, O[mt][nv], [&](float & v, size_t row, size_t) { v *= a[row]; });
++                    }
++                }
++#pragma unroll
++                for (int k32 = 0; k32 < T / 32; ++k32) {
++                    const uint8_t * vb = Vh + (int64_t) (tok0 + 32 * k32) * p.v8_s1;
++                    // per-token scales of block s: lane l -> token 32 k32 + 16 j + l
++                    uint32_t vsc[2];
++#pragma unroll
++                    for (int j = 0; j < 2; ++j) vsc[j] = *(const uint16_t *) (vb + (16 * j + lane) * p.v8_s1);
++                    mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, 32, 16, mx::layout::row_major> V0, V1, V2;
++                    mx::joint_matrix_load(sg, V0, gload(vb + (sodd ? 2 : 0)), p.v8_s1);
++                    mx::joint_matrix_load(sg, V1, gload(vb + (sodd ? 18 : 16)), p.v8_s1);
++                    int8_t v0[32], v1[32], v2[32];
++                    int e = 0;
++                    imx::joint_matrix_apply(sg, V0, [&](int8_t & v, size_t, size_t) { v0[e++] = v; });
++                    e = 0;
++                    imx::joint_matrix_apply(sg, V1, [&](int8_t & v, size_t, size_t) { v1[e++] = v; });
++                    if (!sodd) {
++                        mx::joint_matrix_load(sg, V2, gload(vb + 32), p.v8_s1);
++                        e = 0;
++                        imx::joint_matrix_apply(sg, V2, [&](int8_t & v, size_t, size_t) { v2[e++] = v; });
++                    }
++#pragma unroll
++                    for (int th = 0; th < 2; ++th) {
++                        const int kk = 2 * k32 + th;
++                        half dvs[16];
++#pragma unroll
++                        for (int i = 0; i < 16; ++i)
++                            dvs[i] = sycl::bit_cast<half>((uint16_t) sycl::select_from_group(sg, vsc[th], i));
++                        mx::joint_matrix<sycl::sub_group, half, mx::use::b, 16, 16, mx::layout::ext_intel_packed> B[2];
++#pragma unroll
++                        for (int nv = 0; nv < 2; ++nv) {
++                            mx::joint_matrix_fill(sg, B[nv], (half) 0.f);
++                            e = 0;
++                            imx::joint_matrix_apply(sg, B[nv], [&](half & x, size_t, size_t c) {
++                                const int i = 16 * th + e;
++                                const int8_t qv = nv ? v1[i] : ((!sodd && c < 2) ? v2[i] : v0[i]);
++                                x = (half) qv * dvs[e];
++                                ++e;
++                            });
++                        }
++#pragma unroll
++                        for (int mt = 0; mt < MT8; ++mt) {
++                            mx::joint_matrix<sycl::sub_group, half, mx::use::a, 8, 16, mx::layout::row_major> A;
++                            mx::joint_matrix_load(sg, A, lPs + mt * 8 * T + kk * 16, T);
++#pragma unroll
++                            for (int nv = 0; nv < 2; ++nv) mx::joint_matrix_mad(sg, O[mt][nv], A, B[nv], O[mt][nv]);
++                        }
++                    }
++                }
++            }
++
++            // ---- partials (dv order restored) ----
++            float * op = p.Opart + (int64_t) g * R8 * D + DVS * s;
++#pragma unroll
++            for (int mt = 0; mt < MT8; ++mt)
++#pragma unroll
++                for (int nv = 0; nv < 2; ++nv)
++                    imx::joint_matrix_apply(sg, O[mt][nv], [&](float & v, size_t row, size_t c) {
++                        op[(mt * 8 + row) * D + xfa_q8_vperm(s, nv, (int) c)] = v;
++                    });
++            sycl::group_barrier(it.get_group());
++            for (int r = tid; r < R8; r += NSG * SG) p.ML[(int64_t) g * R8 + r] = sycl::float2(mr[r], lr[r]);
++        });
++    });
++}
++
++
++void xfa_dispatch_q8(sycl::queue & q, const xfa_params & p) {
++    const int R8 = (p.Rw + 7) / 8, R16 = (p.Rw + 15) / 16;
++#define XFA_CASE(a, b) if (R8 == a && R16 == b) {                                                      xfa_launch_main_q8<a, b>(q, p);                                                                   if (p.nchunks <= XFA_CMAX) { xfa_launch_combine2<a * 8>(q, p); } else { xfa_launch_combine<a * 8>(q, p); }         return; }
++    XFA_CASE(1, 1) XFA_CASE(2, 1) XFA_CASE(3, 2) XFA_CASE(4, 2) XFA_CASE(5, 3) XFA_CASE(6, 3)
++#undef XFA_CASE
++    GGML_ABORT("XMX FA q8_0: unsupported rows per work-group %d", p.Rw);
++}
++
+ void xfa_dispatch(sycl::queue & q, const xfa_params & p) {
+     const int R8 = (p.Rw + 7) / 8, R16 = (p.Rw + 15) / 16;
+ #define XFA_CASE(a, b) if (R8 == a && R16 == b) { xfa_run<a, b>(q, p); return; }
+@@ -498,7 +811,8 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
+     // GGML_SYCL_XMX_FA_V2: split any R > 30 in two (the row -> (token, head) map is per row, so a split need not fall on
+     // a token boundary): 7 tokens (42 rows) 725 -> 623 us at kv 65536; 5 tokens (30 rows) stays whole (511 vs 552)
+     static const int qs_env = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_QS", 0);
+-    const bool v2 = ggml_sycl_fattn_xmx_v2();
++    const bool q8 = K->type == GGML_TYPE_Q8_0;
++    const bool v2 = q8 || ggml_sycl_fattn_xmx_v2();   // the q8_0 kernel always uses the FA_V2 launch policy
+     int qs = v2 ? ((R > 30 && R % 2 == 0) ? 2 : 1) : ((R > 24 && nb % 2 == 0) ? 2 : 1);
+     if (qs_env > 0 && (v2 ? R % qs_env : nb % qs_env) == 0 && (R / qs_env) <= XFA_MAXR) {
+         qs = qs_env;
+@@ -555,7 +869,23 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
+     p.scale   = scale;
+     p.qs      = qs;
+     p.Rw      = Rw;
+-
++    p.K8      = nullptr;
++    p.V8      = nullptr;
++    p.k8_s1 = p.k8_s2 = p.v8_s1 = p.v8_s2 = 0;
++
++    if (q8) {
++        p.K     = nullptr;
++        p.V     = nullptr;
++        p.k_s1 = p.k_s2 = p.v_s1 = p.v_s2 = 0;
++        p.K8    = (const uint8_t *) K->data;
++        p.V8    = (const uint8_t *) V->data;
++        p.k8_s1 = K->nb[1];
++        p.k8_s2 = K->nb[2];
++        p.v8_s1 = V->nb[1];
++        p.v8_s2 = V->nb[2];
++        xfa_dispatch_q8(*ctx.stream(), p);
++        return;
++    }
+     xfa_dispatch(*ctx.stream(), p);
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+diff --git a/ggml/src/ggml-sycl/fattn-xmx.hpp b/ggml/src/ggml-sycl/fattn-xmx.hpp
+index ec0b8627c3..a6ca73ad37 100644
+--- a/ggml/src/ggml-sycl/fattn-xmx.hpp
++++ b/ggml/src/ggml-sycl/fattn-xmx.hpp
+@@ -20,6 +20,10 @@
+ // value of the GGML_SYCL_XMX_FA env switch (default 0), read once
+ bool ggml_sycl_fattn_xmx_env();
+ 
++// value of the GGML_SYCL_XMX_FA_Q8 env switch (default 0, LOCAL): the same kernel structure for a q8_0 K/V cache
++// (2D int8 block loads, dequantized to f16 in registers), 1..8 query tokens (GGML_SYCL_XMX_FA_Q8_MIN_COLS / _MAX_COLS)
++bool ggml_sycl_fattn_xmx_q8_env();
++
+ // true when the device has f16 matrix hardware for this kernel; probed once per device and cached
+ bool ggml_sycl_fattn_xmx_device_ok(int device);
+ 
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 291e984a0f..3d6e12384f 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -483,6 +483,7 @@ static void ggml_check_sycl() try {
+         } else {
+             GGML_LOG_INFO("  GGML_SYCL_XMX_FA: %d (not built, -DGGML_SYCL_XMX=OFF)\n", (int) ggml_sycl_fattn_xmx_env());
+         }
++        GGML_LOG_INFO("  GGML_SYCL_XMX_FA_Q8: %d\n", (int) ggml_sycl_fattn_xmx_q8_env());
+         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN_MAX_KV: %d\n", g_ggml_sycl_fa_onednn_max_kv);
+         GGML_LOG_INFO("  GGML_SYCL_ENABLE_MKL_FA: %d\n", g_ggml_sycl_enable_mkl_fa);
+         GGML_LOG_INFO("  GGML_SYCL_MEMTRACE: %d\n", g_ggml_sycl_memtrace);
+diff --git a/scripts/b70/gguf_draft_head_trim.py b/scripts/b70/gguf_draft_head_trim.py
+new file mode 100644
+index 0000000000..018a1685dd
+--- /dev/null
++++ b/scripts/b70/gguf_draft_head_trim.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++# Copy a GGUF, keeping only the first N rows of the MTP draft head blk.<n_layer>.nextn.draft_head.weight (any type:
++# quantized rows are independent, so a row slice of the raw bytes is exactly the first N rows). Every other tensor and
++# all metadata are copied as-is. The drafter then proposes only ids < N; the target still verifies over the full vocab.
++# Usage: gguf_draft_head_trim.py <src.gguf> <dst.gguf> <N>     e.g. N = 65536 (dh64k) or 49152 (dh48k)
++import sys
++import numpy as np
++import gguf
++
++src, dst, n_keep = sys.argv[1], sys.argv[2], int(sys.argv[3])
++reader = gguf.GGUFReader(src)
++arch = reader.fields[gguf.Keys.General.ARCHITECTURE].contents()
++writer = gguf.GGUFWriter(dst, arch=arch, endianess=reader.endianess)
++
++for field in reader.fields.values():
++    if field.name == gguf.Keys.General.ARCHITECTURE or field.name.startswith('GGUF.'):
++        continue
++    val_type = field.types[0]
++    sub_type = field.types[-1] if val_type == gguf.GGUFValueType.ARRAY else None
++    writer.add_key_value(field.name, field.contents(), val_type, sub_type=sub_type)
++
++n_layer = int(reader.fields[f"{arch}.block_count"].contents()) - int(reader.fields[f"{arch}.nextn_predict_layers"].contents())
++dh_name = f"blk.{n_layer}.nextn.draft_head.weight"
++
++new_data = {}
++found = False
++for t in reader.tensors:
++    data = t.data
++    if t.name == dh_name:
++        found = True
++        n_rows = int(t.shape[1])
++        assert 0 < n_keep < n_rows, (n_keep, n_rows)
++        assert data.shape[0] == n_rows, (data.shape, t.shape)   # one row of raw bytes (or elements) per vocab id
++        data = np.ascontiguousarray(data[:n_keep])
++        new_data[t.name] = data
++        print(f"{dh_name}: {gguf.GGMLQuantizationType(t.tensor_type).name} rows {n_rows} -> {n_keep}", flush=True)
++    writer.add_tensor_info(t.name, data.shape, data.dtype, data.nbytes, t.tensor_type)
++assert found, f"{dh_name} not in {src}"
++
++writer.write_header_to_file()
++writer.write_kv_data_to_file()
++writer.write_ti_data_to_file()
++for i, t in enumerate(reader.tensors):
++    writer.write_tensor_data(new_data.get(t.name, t.data), tensor_endianess=reader.endianess)
++    if i % 100 == 0:
++        print(f"  tensor {i}/{len(reader.tensors)}", flush=True)
++writer.close()
++print("done", dst, flush=True)
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 2b98a552f4..2608249fe7 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -5,6 +5,7 @@
+ #include "llama-memory.h"
+ 
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <algorithm>
+ #include <sstream>
+@@ -22,6 +23,16 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd
+     seq_idx.resize(LLAMA_MAX_SEQ, -1);
+ }
+ 
++// [draftcost] env LLAMA_BALLOC_FAST=1 (default 0): skip the per-decode LLAMA_MAX_SEQ^2 coupled-sequence reset and
++// scan when the batch couples no sequences (validation and results unchanged)
++static bool llama_balloc_fast() {
++    static const bool on = [] {
++        const char * e = getenv("LLAMA_BALLOC_FAST");
++        return e && atoi(e) != 0;
++    }();
++    return on;
++}
++
+ bool llama_batch_allocr::init(
+         const llama_batch & batch_inp,
+         const llama_vocab & vocab,
+@@ -320,7 +331,9 @@ bool llama_batch_allocr::init(
+         }
+     }
+ 
+-    if (memory) {
++    // [draftcost] LLAMA_BALLOC_FAST=1: seq_cpl is only ever set together with has_cpl, so without coupled sequences in
++    // this batch the n_seq_max^2 scan (65536 checks with a unified KV cache, every decode) finds nothing: skip it
++    if (memory && (!llama_balloc_fast() || has_cpl)) {
+         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
+             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
+                 if (seq_cpl[s0][s1]) {
+@@ -735,8 +748,12 @@ void llama_batch_allocr::clear() {
+         cur.clear();
+     }
+ 
+-    for (auto & cur : seq_cpl) {
+-        std::fill(cur.begin(), cur.end(), false);
++    // [draftcost] LLAMA_BALLOC_FAST: has_cpl still describes the previous batch here; if it had no coupled sequences,
++    // no seq_cpl entry was set and the LLAMA_MAX_SEQ^2 reset is a no-op
++    if (!llama_balloc_fast() || has_cpl) {
++        for (auto & cur : seq_cpl) {
++            std::fill(cur.begin(), cur.end(), false);
++        }
+     }
+ 
+     seq_set.clear();
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d43f4b547a..83f27055f0 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2076,6 +2076,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         auto * t_logits  = res->get_logits();
+         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
+         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
++        const int64_t hp_ex_t0 = hp_dec ? ggml_time_us() : 0; // [draftcost] output extraction enqueue
+ 
+         if (t_embd && res->get_embd_pooled()) {
+             t_embd = res->get_embd_pooled();
+@@ -2092,7 +2093,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             if (n_outputs) {
+                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
++                const int64_t n_lg = t_logits->ne[0];
++                if (n_lg == n_vocab) {
++                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
++                } else {
++                    // [draftcost] a narrower logits tensor (MTP draft head, LLAMA_MTP_DRAFT_NOPAD): the ids >= n_lg
++                    // can never be drawn, so each row's tail reads -inf, as the padded graph's -1e30 did for any top-k
++                    GGML_ASSERT(n_lg < n_vocab && t_logits->nb[1] == (size_t) n_lg*sizeof(float));
++                    for (int64_t r = 0; r < n_outputs; ++r) {
++                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out + r*n_vocab,
++                                r*n_lg*sizeof(float), n_lg*sizeof(float));
++                        std::fill(logits_out + r*n_vocab + n_lg, logits_out + (r + 1)*n_vocab, -INFINITY);
++                    }
++                }
+             }
+         }
+ 
+@@ -2186,6 +2199,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+         }
++        if (hp_ex_t0) {
++            llama_hprof_add(hp_dec_tag + ".extract", hp_ex_t0);
++        }
+ 
+         n_outputs_prev += n_outputs;
+         n_tokens_prev  += ubatch.n_tokens;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 02ae8bd92a..9c7b469a86 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2644,6 +2644,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+         ggml_prec_set_acc(cur, GGML_PREC_F32);
++        // [draftcost] tag the attention of an MTP draft context (op_params[15], otherwise unused and ignored by every
++        // backend except SYCL's GGML_SYCL_XMX_FA_DRAFT_N1), so a backend can pick a draft-only kernel: the draft's
++        // outputs never reach the target, which verifies every token itself
++        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
++            cur->op_params[15] = 0x4D545044; // 'MTPD'
++        }
+ 
+         if (v_mla) {
+ #if 0
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 6f81a455b6..dab22d51c7 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -654,7 +654,14 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     } else if (n_sub_env > 0 && n_sub_env < n_vocab_head && !ggml_is_quantized(head_w->type)) {
+         head_sub = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_sub_env, head_w->nb[1], 0);
+     }
+-    if (head_sub) {
++    // [draftcost] LLAMA_MTP_DRAFT_NOPAD=1 (default off): leave the draft logits n_sub wide instead of padding them to
++    // the full vocab with -1e30. Ids < n_sub keep their column, so the draft sampler's top-k (backend top-k over n_sub
++    // columns instead of n_vocab, or the host path, where llama_context fills the tail of each row with -inf) selects
++    // exactly the same candidates; it saves the fill/pad/scale/add chain and 60% of the top-k scan per draft token.
++    static const bool no_pad = getenv("LLAMA_MTP_DRAFT_NOPAD") && atoi(getenv("LLAMA_MTP_DRAFT_NOPAD")) != 0;
++    if (head_sub && no_pad) {
++        cur = build_lora_mm(head_sub, cur, head_sub == layer.nextn.draft_head ? nullptr : head_s);
++    } else if (head_sub) {
+         cur = build_lora_mm(head_sub, cur, head_sub == layer.nextn.draft_head ? nullptr : head_s);
+         const int n_pad = (int) (n_vocab_head - head_sub->ne[1]);
+         // 1 over the subset, 0 over the padded tail -> bias 0 / -1e30 (fill needs a contiguous tensor, so no view)
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f43472896d..2b6ca74c17 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -386,3 +386,5 @@ llama_build(test-spechost-inputs.cpp)
+ # LOCAL (hostv): LLAMA_GRAPH_REUSE_MULTI end-to-end exactness / host-time probe on a random tiny QWEN35 (+MTP)
+ llama_build(test-hostv-reuse.cpp)
+ llama_build(test-hostv-sampling.cpp)
++# LOCAL (draftcost): MTP draft-loop host cost / q8_0 draft KV probe on a random tiny QWEN35 (+MTP)
++llama_build(test-draftcost-host.cpp)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 045dfc3020..f47912e648 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11095,6 +11095,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1},  4096, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
++    // LOCAL (xmx-fa q8): the SYCL XMX FA kernel for a q8_0 KV cache (GGML_SYCL_XMX_FA_Q8=1): seat decode/verify
++    // shapes in the real KV-cache layout (K nb1 = 4*8*34 = 1088 B, nb2 = 272 B), a partial last chunk + KV-cache view
++    // (4160), and the other GQA tilings
++    for (int kv : { 4096, 32768, 65536, 81920, }) {
++        for (int nb : { 1, 2, 3, 4, 5, 6, 7, 8, }) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++        }
++    }
++    for (int nb : { 1, 3, 5, 7, 8, }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4160, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true));
++    }
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1},  4096, 5, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 4096, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true));
++    // prefill-size ubatch over a q8_0 cache (oneDNN SDPA after a q8_0 -> f16 dequant of K/V)
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++    // LOCAL (draftcost): the other q8_0-cache batch sizes of a q8_0 target / MTP draft KV: 9..31 tokens (TILE on the
++    // dequantized cache), a full 2048-token prefill ubatch (oneDNN), and a catch-up/verify n=1..8 at a 1-chunk KV
++    for (int nb : { 9, 12, 16, 31, 2048, }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++    }
++    for (int nb : { 1, 4, 8, }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++    }
+ 
+     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
+     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
+@@ -11495,6 +11519,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {248320, 1, 1, 1}));
++    // LOCAL (draftcost): MTP draft-token costs - trimmed draft heads (65536 / 49152 rows), the draft sampler's
++    // top-k(10) over the padded vocab vs the draft-head width, and the draft attention at full seat depth
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 65536, 1, 5120, { 1, 1 }, { 1, 1 }));
++    for (int cols : { 248320, 98304, 65536, 49152 }) {
++        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 1, 1, 1}, 10));
++    }
++    for (ggml_type kvt : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++        for (int kv : { 98304, 131072 }) {
++            for (int nb : { 1, 2, 4, 8 }) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt, kvt, {0, 2, 1, 3}, false));
++            }
++        }
++    }
+ 
+     // LOCAL (not for upstream): model-shape q4_K matmuls at verify column counts (SYCL oneDNN u4 path vs MMVQ)
+     // (1024x5120: small-weight check for the XMX column window, as for q6_K below)
+@@ -11846,6 +11883,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+         }
+     }
++    // LOCAL (xmx-fa q8): the same shapes with a q8_0 KV cache (GGML_SYCL_XMX_FA_Q8=1; K nb1 = 1088, nb2 = 272)
++    for (int kv : { 4096, 32768, 49152, 65536, 81920, 131072, }) {
++        for (int nb : { 1, 2, 3, 4, 5, 6, 7, 8, }) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++        }
++    }
++    // LOCAL (xmx-fa q8): a 2048-token prefill ubatch at depth 32k (kv 34816), f16 vs q8_0 cache
++    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 34816, 2048, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
++    }
++    // LOCAL (xmx-fa q8): the KV-cache write of a verify step (k_cur 1024 x n into an 81920-row cache), f16 vs q8_0
++    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, }) {
++        for (int n : { 1, 4, 8, }) {
++            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, t, GGML_TYPE_I64, { 1024, 81920, 1, 1 }, { 1, 1 }, n, false));
++        }
++    }
+ 
+     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
+         for (int hs : { 64, 128, 256, 576, }) {
+diff --git a/tests/test-draftcost-host.cpp b/tests/test-draftcost-host.cpp
+new file mode 100644
+index 0000000000..ae6f7ab6ec
+--- /dev/null
++++ b/tests/test-draftcost-host.cpp
+@@ -0,0 +1,431 @@
++// LOCAL (draftcost): model-free probe of the MTP draft loop on a random tiny QWEN35 (+1 MTP nextn block).
++// Never loads a real model. Measures the host side of the single-token draft decodes (wall time per draft token,
++// llama_decode call, output sync+read) the way common_speculative_impl_draft_mtp::draft() drives them, and checks the
++// draft outputs of a q8_0 draft KV cache against an f16 one.
++//
++//   draft chain: n_draft single-token decodes on the MTP context (token + hidden row), each followed by reading the
++//   draft sampler's result (backend top-k candidates, or the raw logits) and the h_nextn row; then a KV rollback and a
++//   catch-up decode of the "accepted" tokens, as in the server loop. Only the draft context is used.
++//
++// usage: test-draftcost-host [steps=300] [n_ctx=65536] [n_prompt=60000] [n_vocab=4096] [backend_sampling=1]
++//                            [n_draft=5] [kv=f16|q8_0|cmp] [n_embd=512] [seed=1] [role=dft|tgt]
++//   kv=cmp runs an f16-KV and a q8_0-KV draft context side by side on the same inputs and reports the max abs
++//   difference of the h_nextn rows and the top-1 agreement of the draft candidates.
++#include "common.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++#include "ggml.h"
++#include "gguf.h"
++#include "llama.h"
++#include "llama-cpp.h"
++
++#include "../src/llama-arch.h"
++#include "../src/llama-ext.h"
++#include "../src/llama-model-saver.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <random>
++#include <string>
++#include <vector>
++
++static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
++    const size_t seed0 = *(const size_t *) userdata;
++    std::hash<std::string> hasher;
++    std::mt19937 gen(seed0 ^ hasher(tensor->name));
++    std::normal_distribution<float> dis(0.0f, 0.1f);
++    const bool is_ssm_a = strstr(tensor->name, "ssm_a") != nullptr;
++    const int64_t ne = ggml_nelements(tensor);
++    if (tensor->type == GGML_TYPE_F32) {
++        std::vector<float> tmp(ne);
++        for (auto & v : tmp) { const float x = dis(gen); v = is_ssm_a ? -fabsf(x) : x; }
++        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
++    } else if (tensor->type == GGML_TYPE_F16) {
++        std::vector<ggml_fp16_t> tmp(ne);
++        for (auto & v : tmp) { const float x = dis(gen); v = ggml_fp32_to_fp16(is_ssm_a ? -fabsf(x) : x); }
++        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
++    } else {
++        GGML_ABORT("unexpected tensor type %s for %s", ggml_type_name(tensor->type), tensor->name);
++    }
++}
++
++static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, uint32_t n_embd) {
++    gguf_context_ptr ret(gguf_init_empty());
++    llama_model_saver ms(LLM_ARCH_QWEN35, ret.get());
++    const uint32_t n_head = 2, n_ff = 384, n_embd_head = n_embd / n_head; // head dim 256 at n_embd 512 (XMX FA)
++
++    ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,        llm_arch_name(LLM_ARCH_QWEN35));
++    ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab);
++    ms.add_kv(LLM_KV_CONTEXT_LENGTH,              uint32_t(262144));
++    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,            n_embd);
++    ms.add_kv(LLM_KV_BLOCK_COUNT,                 n_layer + 1u);
++    ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,        uint32_t(1));
++    ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,         n_ff);
++    ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,     uint32_t(4));
++    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,        n_head);
++    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,     uint32_t(1));
++    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
++    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,     std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
++    ms.add_kv(LLM_KV_SSM_INNER_SIZE,              uint32_t(256));
++    ms.add_kv(LLM_KV_SSM_CONV_KERNEL,             uint32_t(4));
++    ms.add_kv(LLM_KV_SSM_STATE_SIZE,              uint32_t(128));
++    ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,          n_head);
++    ms.add_kv(LLM_KV_SSM_GROUP_COUNT,             uint32_t(2));
++    {
++        std::vector<std::string> list(n_vocab);
++        std::vector<float>       scores(n_vocab, 0.0f);
++        ms.add_kv(LLM_KV_TOKENIZER_MODEL, "test");
++        for (uint32_t i = 0; i < n_vocab; i++) {
++            list[i] = "tok_" + std::to_string(i);
++        }
++        ms.add_kv(LLM_KV_TOKENIZER_LIST,   list);
++        ms.add_kv(LLM_KV_TOKENIZER_SCORES, scores);
++    }
++    return ret;
++}
++
++struct acc_t { int64_t n = 0; double ms = 0; };
++
++// FNV-1a over the draft outputs that decide the drafted token: the backend top-k candidates as a SET (sorted by id,
++// with their logits) or, on the host path, the first n_hash logits of the row, plus the h_nextn row. Two runs that
++// differ only in how the draft logits are laid out (LLAMA_MTP_DRAFT_NOPAD) must print the same value.
++static uint64_t g_hash = 1469598103934665603ull;
++static void hash_bytes(const void * p, size_t n) {
++    const uint8_t * b = (const uint8_t *) p;
++    for (size_t i = 0; i < n; i++) {
++        g_hash = (g_hash ^ b[i]) * 1099511628211ull;
++    }
++}
++
++// role=tgt: two TARGET contexts (f16 KV, q8_0 KV) run the same prompt (2048-token ubatches -> the prefill FA path) and
++// verify steps of 1..8 tokens with all logits + a random-prefix rollback (n_rs_seq 8, KV seq_rm), as the server does.
++// Reports the q8_0-vs-f16 logit difference and argmax agreement; FAIL on non-finite logits.
++static int run_tgt(llama_model * model, int steps, uint32_t n_ctx, int n_prompt, uint32_t n_vocab, size_t seed) {
++    std::vector<llama_context_ptr> ctxs;
++    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++        llama_context_params cp = llama_context_default_params();
++        cp.n_ctx      = n_ctx;
++        cp.n_batch    = 2048;
++        cp.n_ubatch   = 2048;
++        cp.n_seq_max  = 1;
++        cp.kv_unified = true;
++        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++        cp.n_rs_seq   = 8;
++        cp.type_k     = t;
++        cp.type_v     = t;
++        cp.n_threads  = cp.n_threads_batch = 4;
++        llama_context * c = llama_init_from_model(model, cp);
++        GGML_ASSERT(c);
++        ctxs.emplace_back(c);
++    }
++    std::mt19937 rng(seed * 7919 + 3);
++    auto rnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
++    llama_batch batch = llama_batch_init(2048, 0, 1);
++    for (int i0 = 0; i0 < n_prompt; i0 += 2048) {
++        const int n = std::min(2048, n_prompt - i0);
++        common_batch_clear(batch);
++        for (int k = 0; k < n; k++) {
++            common_batch_add(batch, rnd(0, n_vocab - 1), i0 + k, { 0 }, i0 + k == n_prompt - 1);
++        }
++        for (auto & c : ctxs) {
++            GGML_ASSERT(llama_decode(c.get(), batch) == 0);
++        }
++    }
++    double max_d = 0.0, max_l = 0.0, sum_d = 0.0;
++    int64_t n_rows = 0, n_arg_same = 0, n_bad = 0;
++    std::map<int, int64_t> n_by_size;
++    llama_pos pos = n_prompt;
++    for (int step = 0; step < steps && pos + 10 < (llama_pos) n_ctx; step++) {
++        const int n = rnd(1, 8);
++        common_batch_clear(batch);
++        for (int k = 0; k < n; k++) {
++            common_batch_add(batch, rnd(0, n_vocab - 1), pos + k, { 0 }, true);
++        }
++        std::vector<std::vector<float>> lg(ctxs.size());
++        for (size_t ci = 0; ci < ctxs.size(); ci++) {
++            GGML_ASSERT(llama_decode(ctxs[ci].get(), batch) == 0);
++            for (int k = 0; k < n; k++) {
++                const float * l = llama_get_logits_ith(ctxs[ci].get(), k);
++                lg[ci].insert(lg[ci].end(), l, l + n_vocab);
++            }
++        }
++        for (int k = 0; k < n; k++) {
++            const float * a = lg[0].data() + (size_t) k * n_vocab;
++            const float * b = lg[1].data() + (size_t) k * n_vocab;
++            for (uint32_t v = 0; v < n_vocab; v++) {
++                if (!std::isfinite(a[v]) || !std::isfinite(b[v])) { n_bad++; break; }
++                const double d = fabs((double) a[v] - b[v]);
++                max_d = std::max(max_d, d);
++                max_l = std::max(max_l, (double) fabsf(a[v]));
++                sum_d += d;
++            }
++            n_arg_same += (std::max_element(a, a + n_vocab) - a) == (std::max_element(b, b + n_vocab) - b);
++            n_rows++;
++        }
++        n_by_size[n]++;
++        const int n_acc = rnd(1, n);
++        for (auto & c : ctxs) {
++            if (n_acc < n && !llama_memory_seq_rm(llama_get_memory(c.get()), 0, pos + n_acc, -1)) {
++                fprintf(stderr, "seq_rm failed\n");
++                return 1;
++            }
++        }
++        pos += n_acc;
++    }
++    for (auto & c : ctxs) {
++        llama_synchronize(c.get());
++    }
++    fprintf(stderr, "DRAFTCOST-TGT f16 vs q8_0 KV over %lld verify rows (sizes:", (long long) n_rows);
++    for (auto & kv : n_by_size) fprintf(stderr, " n%d=%lld", kv.first, (long long) kv.second);
++    fprintf(stderr, "): max|dlogit|=%.4g mean=%.4g (max|logit|=%.4g) argmax agree %lld/%lld\n",
++            max_d, sum_d / std::max<int64_t>(1, n_rows * n_vocab), max_l, (long long) n_arg_same, (long long) n_rows);
++    fprintf(stderr, "DRAFTCOST %s non-finite rows=%lld\n", n_bad == 0 ? "PASS" : "FAIL", (long long) n_bad);
++    llama_batch_free(batch);
++    ctxs.clear();
++    return n_bad == 0 ? 0 : 1;
++}
++
++int main(int argc, char ** argv) {
++    const int         steps    = argc > 1 ? atoi(argv[1]) : 300;
++    const uint32_t    n_ctx    = argc > 2 ? atoi(argv[2]) : 65536;
++    const int         n_prompt = argc > 3 ? atoi(argv[3]) : 60000;
++    const uint32_t    n_vocab  = argc > 4 ? atoi(argv[4]) : 4096;
++    const bool        bsamp    = argc > 5 ? atoi(argv[5]) != 0 : true;
++    const int         n_draft  = argc > 6 ? atoi(argv[6]) : 5;
++    const std::string kv       = argc > 7 ? argv[7] : "f16";
++    const uint32_t    n_embd   = argc > 8 ? atoi(argv[8]) : 512;
++    const size_t      seed     = argc > 9 ? atoll(argv[9]) : 1;
++
++    llama_backend_init();
++
++    ggml_backend_dev_t dev = nullptr;
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            dev = ggml_backend_dev_get(i);
++            break;
++        }
++    }
++    if (!dev) {
++        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    }
++    fprintf(stderr, "device: %s steps=%d n_ctx=%u n_prompt=%d n_vocab=%u backend_sampling=%d n_draft=%d kv=%s n_embd=%u\n",
++            ggml_backend_dev_description(dev), steps, n_ctx, n_prompt, n_vocab, (int) bsamp, n_draft, kv.c_str(), n_embd);
++
++    auto gguf = make_qwen35(4, n_vocab, n_embd);
++    llama_model_params mp = llama_model_default_params();
++    std::vector<ggml_backend_dev_t> devs = { dev, nullptr };
++    mp.devices  = devs.data();
++    mp.load_mtp = true;
++    size_t wseed = seed;
++    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &wseed, mp));
++    GGML_ASSERT(model);
++    const int n_embd_m = llama_model_n_embd(model.get());
++
++    if (argc > 10 && std::string(argv[10]) == "tgt") {
++        const int rc = run_tgt(model.get(), steps, n_ctx, n_prompt, n_vocab, seed);
++        model.reset();
++        llama_backend_free();
++        return rc;
++    }
++
++    const bool cmp = kv == "cmp";
++    // host path: hash only the ids a trimmed draft vocabulary can produce (LLAMA_MTP_DRAFT_VOCAB), since the tail is
++    // -1e30 when padded and -inf with LLAMA_MTP_DRAFT_NOPAD
++    const size_t n_hash = getenv("LLAMA_MTP_DRAFT_VOCAB") ? (size_t) atoll(getenv("LLAMA_MTP_DRAFT_VOCAB")) : (size_t) n_vocab;
++    std::vector<ggml_type> kv_types;
++    if (cmp) {
++        kv_types = { GGML_TYPE_F16, GGML_TYPE_Q8_0 };
++    } else {
++        kv_types = { kv == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_F16 };
++    }
++
++    std::vector<llama_context_ptr> dfts;
++    std::vector<llama_sampler *>   chains;
++    for (ggml_type t : kv_types) {
++        llama_context_params cp = llama_context_default_params();
++        cp.n_ctx      = n_ctx;
++        cp.n_batch    = 2048;
++        cp.n_ubatch   = 2048;
++        cp.n_seq_max  = 1;
++        cp.kv_unified = true;
++        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++        cp.n_rs_seq   = 0;
++        cp.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
++        cp.type_k     = t;
++        cp.type_v     = t;
++        cp.n_threads  = cp.n_threads_batch = 4;
++        llama_context * c = llama_init_from_model(model.get(), cp);
++        GGML_ASSERT(c);
++        llama_set_embeddings_nextn(c, true, true);
++        llama_sampler * chain = nullptr;
++        if (bsamp) {
++            chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
++            llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
++            if (!llama_set_sampler(c, 0, chain)) {
++                fprintf(stderr, "backend sampler not supported\n");
++                llama_sampler_free(chain);
++                chain = nullptr;
++            }
++        }
++        chains.push_back(chain);
++        dfts.emplace_back(c);
++    }
++
++    std::mt19937 rng(seed * 7919 + 1);
++    auto rnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++
++    llama_batch batchd = llama_batch_init(2048, n_embd_m, 1);
++    std::vector<llama_token> tok_store(2048);
++    batchd.token = tok_store.data(); // llama_batch_init allocates either token or embd; MTP batches carry both
++
++    // --- prompt: fill the draft KV to n_prompt (random hidden rows so the attention sees non-trivial values)
++    for (int i0 = 0; i0 < n_prompt; i0 += 2048) {
++        const int n = std::min(2048, n_prompt - i0);
++        batchd.n_tokens = n;
++        for (int k = 0; k < n; k++) {
++            batchd.token[k] = rnd(0, n_vocab - 1); batchd.pos[k] = i0 + k; batchd.n_seq_id[k] = 1; batchd.seq_id[k][0] = 0; batchd.logits[k] = 0;
++            for (int e = 0; e < n_embd_m; e++) batchd.embd[(size_t) k * n_embd_m + e] = nd(rng);
++        }
++        for (auto & c : dfts) {
++            GGML_ASSERT(llama_decode(c.get(), batchd) == 0);
++        }
++    }
++    for (auto & c : dfts) {
++        llama_synchronize(c.get());
++    }
++    fprintf(stderr, "prompt done (%d tokens)\n", n_prompt);
++
++    std::map<std::string, acc_t> tm;
++    auto add = [&](const std::string & k, int64_t t0) { auto & a = tm[k]; a.n++; a.ms += (ggml_time_us() - t0) / 1000.0; };
++
++    double max_dh = 0.0, max_h = 0.0;
++    int64_t n_top1 = 0, n_top1_same = 0;
++    int n_bad = 0;
++
++    llama_pos pos = n_prompt;
++    llama_token last = rnd(0, n_vocab - 1);
++    std::vector<float> pending(n_embd_m);
++    for (auto & x : pending) x = nd(rng);
++
++    for (int step = 0; step < steps && pos + n_draft + 2 < (llama_pos) n_ctx; step++) {
++        std::vector<std::vector<float>>       h_out(dfts.size());
++        std::vector<std::vector<llama_token>> top1(dfts.size());
++        for (size_t ci = 0; ci < dfts.size(); ci++) {
++            llama_context * c = dfts[ci].get();
++            std::vector<float> h = pending;
++            llama_token tok = last;
++            const int64_t t_chain = ggml_time_us();
++            for (int d = 0; d < n_draft; d++) {
++                batchd.n_tokens = 1;
++                batchd.token[0] = tok; batchd.pos[0] = pos + d; batchd.n_seq_id[0] = 1; batchd.seq_id[0][0] = 0; batchd.logits[0] = 1;
++                memcpy(batchd.embd, h.data(), n_embd_m * sizeof(float));
++                int64_t t0 = ggml_time_us();
++                GGML_ASSERT(llama_decode(c, batchd) == 0);
++                add("draft.decode_call", t0);
++                t0 = ggml_time_us();
++                llama_token best = -1;
++                if (chains[ci]) {
++                    const uint32_t      nc  = llama_get_sampled_candidates_count_ith(c, 0);
++                    const llama_token * cid = llama_get_sampled_candidates_ith(c, 0);
++                    const float       * clg = llama_get_sampled_logits_ith(c, 0);
++                    float bl = -INFINITY;
++                    std::vector<std::pair<llama_token, float>> cand;
++                    for (uint32_t k = 0; k < nc; k++) {
++                        if (clg[k] > bl) { bl = clg[k]; best = cid[k]; }
++                        cand.emplace_back(cid[k], clg[k]);
++                    }
++                    std::sort(cand.begin(), cand.end());
++                    for (auto & pr : cand) {
++                        hash_bytes(&pr.first, sizeof(pr.first));
++                        hash_bytes(&pr.second, sizeof(pr.second));
++                    }
++                } else {
++                    const float * lg = llama_get_logits_ith(c, 0);
++                    best = (llama_token) (std::max_element(lg, lg + n_vocab) - lg);
++                    hash_bytes(lg, sizeof(float) * std::min<size_t>(n_hash, n_vocab));
++                    hash_bytes(&best, sizeof(best));
++                }
++                const float * hr = llama_get_embeddings_nextn_ith(c, 0);
++                add("draft.sync+read", t0);
++                hash_bytes(hr, sizeof(float) * n_embd_m);
++                memcpy(h.data(), hr, n_embd_m * sizeof(float));
++                for (int e = 0; e < n_embd_m; e++) {
++                    if (!std::isfinite(hr[e])) { n_bad++; break; }
++                }
++                h_out[ci].insert(h_out[ci].end(), hr, hr + n_embd_m);
++                top1[ci].push_back(best);
++                // cmp mode: both contexts draft the SAME chain (the f16 one's tokens and rows) so they stay comparable
++                tok = (cmp && ci > 0) ? top1[0][d] : (best >= 0 ? best : 0);
++                if (cmp && ci > 0) {
++                    memcpy(h.data(), h_out[0].data() + (size_t) d * n_embd_m, n_embd_m * sizeof(float));
++                }
++            }
++            add("draft.chain", t_chain);
++            const int64_t t0 = ggml_time_us();
++            llama_memory_seq_rm(llama_get_memory(c), 0, pos, -1);
++            add("draft.seq_rm", t0);
++        }
++        // accept a random prefix: catch-up decode of the accepted tokens with fresh random rows
++        const int n_acc = rnd(1, n_draft + 1);
++        batchd.n_tokens = n_acc;
++        for (int k = 0; k < n_acc; k++) {
++            batchd.token[k] = rnd(0, n_vocab - 1); batchd.pos[k] = pos + k; batchd.n_seq_id[k] = 1; batchd.seq_id[k][0] = 0; batchd.logits[k] = 0;
++            for (int e = 0; e < n_embd_m; e++) batchd.embd[(size_t) k * n_embd_m + e] = nd(rng);
++        }
++        for (auto & c : dfts) {
++            const int64_t t0 = ggml_time_us();
++            GGML_ASSERT(llama_decode(c.get(), batchd) == 0);
++            add("catchup.decode_call", t0);
++        }
++        for (int e = 0; e < n_embd_m; e++) pending[e] = nd(rng);
++        pos += n_acc;
++        last = rnd(0, n_vocab - 1);
++
++        if (cmp) {
++            for (size_t i = 0; i < h_out[0].size(); i++) {
++                max_dh = std::max(max_dh, (double) fabsf(h_out[0][i] - h_out[1][i]));
++                max_h  = std::max(max_h,  (double) fabsf(h_out[0][i]));
++            }
++            for (size_t i = 0; i < top1[0].size(); i++) {
++                n_top1++;
++                n_top1_same += top1[0][i] == top1[1][i];
++            }
++        }
++    }
++    for (auto & c : dfts) {
++        llama_synchronize(c.get());
++    }
++    for (auto & kv2 : tm) {
++        fprintf(stderr, "   %-22s n=%7lld avg=%8.3f ms\n", kv2.first.c_str(), (long long) kv2.second.n, kv2.second.ms / kv2.second.n);
++    }
++    const auto & ch = tm["draft.chain"];
++    fprintf(stderr, "DRAFTCOST wall per draft token %.3f ms (%lld chains of %d)\n",
++            ch.ms / std::max<int64_t>(1, ch.n) / n_draft, (long long) ch.n, n_draft);
++    if (cmp) {
++        fprintf(stderr, "DRAFTCOST-CMP f16 vs q8_0 KV: max|dh|=%.4g (max|h|=%.4g) top1 agree %lld/%lld\n",
++                max_dh, max_h, (long long) n_top1_same, (long long) n_top1);
++    }
++    fprintf(stderr, "DRAFTCOST-HASH %016llx (host-path logits hashed: first %zu)\n", (unsigned long long) g_hash, n_hash);
++    const bool pass = n_bad == 0;
++    fprintf(stderr, "DRAFTCOST %s non-finite rows=%d\n", pass ? "PASS" : "FAIL", n_bad);
++
++    batchd.token = nullptr;
++    llama_batch_free(batchd);
++    for (size_t ci = 0; ci < dfts.size(); ci++) {
++        if (chains[ci]) {
++            llama_set_sampler(dfts[ci].get(), 0, nullptr);
++        }
++        dfts[ci].reset();
++        if (chains[ci]) {
++            llama_sampler_free(chains[ci]);
++        }
++    }
++    model.reset();
++    llama_backend_free();
++    return pass ? 0 : 1;
++}

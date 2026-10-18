@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Mon, 28 Sep 2026 02:05:43 -0600
+Subject: [PATCH 20/27] sycl : let MTP draft graphs replay with a quantized
+ draft KV
+
+A quantized KV cache adds Hadamard rotation matmuls whose row count is
+tokens x heads x dim/64. The graph cache's token limit read that as a
+token count, so every draft and catch-up graph of an MTP context with
+a q8_0 KV ran eagerly. GGML_SYCL_GRAPH_ROT_ROWS=1 (default off) leaves
+FWHT-served rotation matmuls out of that test. Adds a too_big reason
+line to GGML_SYCL_GRAPH_STATS and head-count options to the host
+harnesses.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-sycl/fwht.cpp      | 14 ++++++-
+ ggml/src/ggml-sycl/fwht.hpp      |  3 ++
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 65 ++++++++++++++++++++++++++++----
+ tests/test-draftcost-host.cpp    | 29 ++++++++++----
+ tests/test-hostv-reuse.cpp       | 22 +++++++++--
+ 5 files changed, 113 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/fwht.cpp b/ggml/src/ggml-sycl/fwht.cpp
+index 39f273beaa..02908f2c93 100644
+--- a/ggml/src/ggml-sycl/fwht.cpp
++++ b/ggml/src/ggml-sycl/fwht.cpp
+@@ -240,7 +240,7 @@ static void launch_kronecker(const float *   src,
+                          });
+ }
+ 
+-bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
++bool ggml_sycl_fwht_supported(const ggml_tensor * src, const ggml_tensor * dst) {
+     if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+         return false;
+     }
+@@ -250,6 +250,18 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
+     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+         return false;
+     }
++    switch (src->ne[0]) {
++        case 64: case 128: case 256: case 512: case 384: case 768: case 640: case 1280:
++            return true;
++        default:
++            return false;
++    }
++}
++
++bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
++    if (!ggml_sycl_fwht_supported(src, dst)) {
++        return false;
++    }
+ 
+     const int     n    = (int) src->ne[0];
+     const int64_t rows = ggml_nrows(src);
+diff --git a/ggml/src/ggml-sycl/fwht.hpp b/ggml/src/ggml-sycl/fwht.hpp
+index cd238cfaf3..4d019472b3 100644
+--- a/ggml/src/ggml-sycl/fwht.hpp
++++ b/ggml/src/ggml-sycl/fwht.hpp
+@@ -9,4 +9,7 @@
+ // ordinary mat-mul dispatch.
+ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
+ 
++// [draftreplay] true if ggml_sycl_op_fwht() serves this src/dst pair (same test it applies itself)
++bool ggml_sycl_fwht_supported(const ggml_tensor * src, const ggml_tensor * dst);
++
+ #endif  // GGML_SYCL_FWHT_HPP
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 6cf1af06ba..7b0addeafc 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -7025,6 +7025,11 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+ //                                 or re-allocate (same graph uid, node array, node count, no weight reorder and no
+ //                                 device free since) instead of hashing all nodes again; 2: also hash and abort on
+ //                                 any difference (test mode)
++//   GGML_SYCL_GRAPH_ROT_ROWS=0    [draftreplay] 1: the MAX_TOKENS test ignores the Hadamard-rotation MUL_MATs of a
++//                                 quantized KV cache (llama_mul_mat_hadamard, GGML_HINT_SRC0_IS_HADAMARD) that the FWHT
++//                                 kernel serves: their rows are n_tokens * n_head * (head_dim / 64), not tokens, so a
++//                                 1-token MTP draft with a q8_0 draft KV (24 heads) counted 96 rows and never replayed.
++//                                 The weight MUL_MATs and FLASH_ATTN_EXT still see the real token count.
+ //   GGML_SYCL_GRAPH_SELFTEST=1    test hook: eager run, poison node outputs with 0xFF, record, replay
+ //                                 (so test-backend-ops compares the REPLAYED result against the CPU);
+ //                                 =2 is the harness's negative control (records but never replays)
+@@ -7040,6 +7045,7 @@ struct ggml_sycl_graph_cfg {
+     int selftest  = 0;
+     int record_ahead = 0; // [hostv]
+     int sig_memo     = 0; // [hostv]
++    int rot_rows     = 0; // [draftreplay]
+ };
+ 
+ static const ggml_sycl_graph_cfg & ggml_sycl_graph_config() {
+@@ -7054,9 +7060,11 @@ static const ggml_sycl_graph_cfg & ggml_sycl_graph_config() {
+         c.selftest  = ggml_sycl_get_env("GGML_SYCL_GRAPH_SELFTEST", 0);
+         c.record_ahead = ggml_sycl_get_env("GGML_SYCL_GRAPH_RECORD_AHEAD", 0);
+         c.sig_memo     = ggml_sycl_get_env("GGML_SYCL_GRAPH_SIG_MEMO", 0);
++        c.rot_rows     = ggml_sycl_get_env("GGML_SYCL_GRAPH_ROT_ROWS", 0);
+         if (g_ggml_sycl_enable_graph) {
+-            GGML_LOG_INFO("[SYCL-GRAPH] cache=%d warmup=%d max=%d min_nodes=%d max_tokens=%d stats=%d selftest=%d record_ahead=%d sig_memo=%d\n",
+-                          c.cache, c.warmup, c.max, c.min_nodes, c.max_tokens, c.stats, c.selftest, c.record_ahead, c.sig_memo);
++            GGML_LOG_INFO("[SYCL-GRAPH] cache=%d warmup=%d max=%d min_nodes=%d max_tokens=%d stats=%d selftest=%d record_ahead=%d sig_memo=%d rot_rows=%d\n",
++                          c.cache, c.warmup, c.max, c.min_nodes, c.max_tokens, c.stats, c.selftest, c.record_ahead, c.sig_memo,
++                          c.rot_rows);
+         }
+         return c;
+     }();
+@@ -7119,6 +7127,8 @@ static double   g_gstat_sig_us = 0;
+ static double   g_gstat_t_eager_us = 0, g_gstat_t_record_us = 0, g_gstat_t_finalize_us = 0, g_gstat_t_replay_us = 0;
+ static uint64_t g_gstat_n_finalize = 0, g_gstat_n_eager_timed = 0;
+ static uint64_t g_gstat_record_ahead = 0, g_gstat_record_ahead_fail = 0, g_gstat_memo_hit = 0, g_gstat_memo_checked = 0; // [hostv]
++static uint64_t g_gstat_too_big = 0, g_gstat_incompat = 0; // [draftreplay]
++static std::map<std::string, uint64_t> g_gstat_too_big_reason;
+ 
+ // ---- [spechost] GGML_SYCL_GRAPH_MISSLOG=N: explain why a graph got a NEW cache signature (eager/record instead of
+ // replay). For every new signature it compares the graph node by node with the previous graph of the same shape class
+@@ -7259,6 +7269,11 @@ static void ggml_sycl_graph_stats_print() {
+                 (unsigned long long) g_gstat_record_ahead, (unsigned long long) g_gstat_record_ahead_fail,
+                 (unsigned long long) g_gstat_memo_hit, (unsigned long long) g_gstat_memo_checked);
+     }
++    fprintf(stderr, "[SYCL-GRAPH] draftreplay: too_big=%llu incompatible(not in calls)=%llu\n",
++            (unsigned long long) g_gstat_too_big, (unsigned long long) g_gstat_incompat);
++    for (auto & kv : g_gstat_too_big_reason) {
++        fprintf(stderr, "[SYCL-GRAPH]   too_big %8llu  %s\n", (unsigned long long) kv.second, kv.first.c_str());
++    }
+     fprintf(stderr, "[SYCL-GRAPH] host ms/call: eager=%.3f record=%.3f finalize=%.3f replay=%.3f\n",
+                   g_gstat_n_eager_timed ? g_gstat_t_eager_us / g_gstat_n_eager_timed / 1e3 : 0.0,
+                   g_gstat_record ? g_gstat_t_record_us / g_gstat_record / 1e3 : 0.0,
+@@ -7396,6 +7411,23 @@ static std::unique_ptr<ggml_sycl_exec_graph_t> ggml_sycl_graph_record(ggml_backe
+     }
+ }
+ 
++// rows a node contributes to the GGML_SYCL_GRAPH_MAX_TOKENS test (-1: none)
++static int64_t ggml_sycl_graph_node_rows(const ggml_tensor * node, const ggml_sycl_graph_cfg & cfg) {
++    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1]) {
++        // [draftreplay] GGML_SYCL_GRAPH_ROT_ROWS: a KV-rotation MUL_MAT that ggml_sycl_mul_mat() hands to the FWHT kernel
++        // (one elementwise-style kernel per call, no host work) does not decide whether the graph is a prefill graph
++        if (cfg.rot_rows > 0 && node->op == GGML_OP_MUL_MAT &&
++            ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD && ggml_sycl_fwht_supported(node->src[1], node)) {
++            return -1;
++        }
++        return node->src[1]->ne[1];
++    }
++    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
++        return node->src[0]->ne[1];
++    }
++    return -1;
++}
++
+ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph) {
+     const ggml_sycl_graph_cfg & cfg = ggml_sycl_graph_config();
+ 
+@@ -7411,15 +7443,29 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
+ 
+     bool too_big = cgraph->n_nodes < cfg.min_nodes;
+     for (int i = 0; i < cgraph->n_nodes && !too_big; i++) {
+-        const ggml_tensor * node = cgraph->nodes[i];
+-        if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[1]) {
+-            too_big = node->src[1]->ne[1] > cfg.max_tokens;
+-        } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+-            too_big = node->src[0]->ne[1] > cfg.max_tokens;
+-        }
++        too_big = ggml_sycl_graph_node_rows(cgraph->nodes[i], cfg) > cfg.max_tokens;
+     }
+     if (too_big) {
+         g_gstat_eager++;
++        if (cfg.stats > 0) {  // [draftreplay] which node made the graph run eagerly
++            g_gstat_too_big++;
++            std::string why = "min_nodes";
++            for (int i = 0; i < cgraph->n_nodes; i++) {
++                const ggml_tensor * node = cgraph->nodes[i];
++                const int64_t nt = ggml_sycl_graph_node_rows(node, cfg);
++                if (nt > cfg.max_tokens) {
++                    why = std::string(cgraph->n_nodes >= 1000 ? "big " : "small ") + ggml_op_name(node->op) + " @" +
++                          ggml_sycl_gmiss_fold(node->name) + " rows=" + std::to_string(nt) +
++                          " src0=" + ggml_sycl_gmiss_fold(node->src[0]->name) + "[" + std::to_string(node->src[0]->ne[0]) + "," +
++                          std::to_string(node->src[0]->ne[1]) + "," + std::to_string(node->src[0]->ne[2]) + "] src1=" +
++                          (node->src[1] ? ggml_sycl_gmiss_fold(node->src[1]->name) + "[" + std::to_string(node->src[1]->ne[0]) + "," +
++                           std::to_string(node->src[1]->ne[1]) + "," + std::to_string(node->src[1]->ne[2]) + "]" : std::string("-")) +
++                          " n_nodes=" + std::to_string(cgraph->n_nodes);
++                    break;
++                }
++            }
++            g_gstat_too_big_reason[why]++;
++        }
+         ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
+         return;
+     }
+@@ -7553,6 +7599,9 @@ static ggml_status ggml_backend_sycl_graph_compute_timed(ggml_backend_t backend,
+     bool use_sycl_graph = false;
+     if (g_ggml_sycl_enable_graph) {
+         use_sycl_graph = check_graph_compatibility(cgraph);
++        if (!use_sycl_graph) {
++            g_gstat_incompat++;  // [draftreplay]
++        }
+     }
+     if (use_sycl_graph) {
+         const bool graph_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
+diff --git a/tests/test-draftcost-host.cpp b/tests/test-draftcost-host.cpp
+index ae6f7ab6ec..9e9c83b20f 100644
+--- a/tests/test-draftcost-host.cpp
++++ b/tests/test-draftcost-host.cpp
+@@ -8,7 +8,9 @@
+ //   catch-up decode of the "accepted" tokens, as in the server loop. Only the draft context is used.
+ //
+ // usage: test-draftcost-host [steps=300] [n_ctx=65536] [n_prompt=60000] [n_vocab=4096] [backend_sampling=1]
+-//                            [n_draft=5] [kv=f16|q8_0|cmp] [n_embd=512] [seed=1] [role=dft|tgt]
++//                            [n_draft=5] [kv=f16|q8_0|cmp] [n_embd=512] [seed=1] [role=dft|tgt] [n_head=0] [n_head_kv=1]
++//   n_head > 0 [draftreplay]: attention with n_head query / n_head_kv KV heads of dim 256 (the house model is 24 / 4),
++//   independent of n_embd; 0 keeps the original layout (2 heads of n_embd/2, 1 KV head)
+ //   kv=cmp runs an f16-KV and a q8_0-KV draft context side by side on the same inputs and reports the max abs
+ //   difference of the h_nextn rows and the top-1 agreement of the draft candidates.
+ #include "common.h"
+@@ -53,10 +55,11 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+     }
+ }
+ 
+-static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, uint32_t n_embd) {
++static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, uint32_t n_embd, uint32_t n_head_attn = 0, uint32_t n_head_kv = 1) {
+     gguf_context_ptr ret(gguf_init_empty());
+     llama_model_saver ms(LLM_ARCH_QWEN35, ret.get());
+-    const uint32_t n_head = 2, n_ff = 384, n_embd_head = n_embd / n_head; // head dim 256 at n_embd 512 (XMX FA)
++    const uint32_t n_head = 2, n_ff = 384; // n_head: GDN time-step rank and (n_head_attn == 0) the attention heads
++    const uint32_t n_embd_head = n_head_attn > 0 ? 256 : n_embd / n_head; // head dim 256 at n_embd 512 (XMX FA)
+ 
+     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,        llm_arch_name(LLM_ARCH_QWEN35));
+     ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab);
+@@ -66,8 +69,15 @@ static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, uint32_t
+     ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,        uint32_t(1));
+     ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,         n_ff);
+     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,     uint32_t(4));
+-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,        n_head);
+-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,     uint32_t(1));
++    if (n_head_attn > 0) {
++        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head_attn);
++        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv);
++        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,    n_embd_head);
++        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,  n_embd_head);
++    } else {
++        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head);
++        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, uint32_t(1));
++    }
+     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
+     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,     std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+     ms.add_kv(LLM_KV_SSM_INNER_SIZE,              uint32_t(256));
+@@ -199,6 +209,8 @@ int main(int argc, char ** argv) {
+     const std::string kv       = argc > 7 ? argv[7] : "f16";
+     const uint32_t    n_embd   = argc > 8 ? atoi(argv[8]) : 512;
+     const size_t      seed     = argc > 9 ? atoll(argv[9]) : 1;
++    const uint32_t    n_head_a = argc > 11 ? atoi(argv[11]) : 0;
++    const uint32_t    n_head_k = argc > 12 ? atoi(argv[12]) : 1;
+ 
+     llama_backend_init();
+ 
+@@ -212,10 +224,11 @@ int main(int argc, char ** argv) {
+     if (!dev) {
+         dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+     }
+-    fprintf(stderr, "device: %s steps=%d n_ctx=%u n_prompt=%d n_vocab=%u backend_sampling=%d n_draft=%d kv=%s n_embd=%u\n",
+-            ggml_backend_dev_description(dev), steps, n_ctx, n_prompt, n_vocab, (int) bsamp, n_draft, kv.c_str(), n_embd);
++    fprintf(stderr, "device: %s steps=%d n_ctx=%u n_prompt=%d n_vocab=%u backend_sampling=%d n_draft=%d kv=%s n_embd=%u n_head=%u n_head_kv=%u\n",
++            ggml_backend_dev_description(dev), steps, n_ctx, n_prompt, n_vocab, (int) bsamp, n_draft, kv.c_str(), n_embd,
++            n_head_a, n_head_k);
+ 
+-    auto gguf = make_qwen35(4, n_vocab, n_embd);
++    auto gguf = make_qwen35(4, n_vocab, n_embd, n_head_a, n_head_k);
+     llama_model_params mp = llama_model_default_params();
+     std::vector<ggml_backend_dev_t> devs = { dev, nullptr };
+     mp.devices  = devs.data();
+diff --git a/tests/test-hostv-reuse.cpp b/tests/test-hostv-reuse.cpp
+index ea954b3472..57bd570074 100644
+--- a/tests/test-hostv-reuse.cpp
++++ b/tests/test-hostv-reuse.cpp
+@@ -14,6 +14,8 @@
+ // (the other envs) can be compared against each other.
+ //
+ // usage: test-hostv-reuse [steps=400] [multi_b=1] [n_layer=64] [n_ctx=4096] [seed=1] [n_vocab=4096] [mtp=1] [n_prompt=300]
++// [draftreplay] env HOSTV_DFT_KV=q8_0: quantized MTP draft KV (server -ctkd/-ctvd q8_0; turns on the KV Hadamard rotation);
++//   env HOSTV_N_HEAD=24 HOSTV_N_HEAD_KV=4: attention heads of dim 256 as in the house model (default 2 / 1 heads of 128)
+ #include "common.h"
+ #include "ggml-backend.h"
+ #include "ggml-cpp.h"
+@@ -65,7 +67,10 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+ static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, bool mtp) {
+     gguf_context_ptr ret(gguf_init_empty());
+     llama_model_saver ms(LLM_ARCH_QWEN35, ret.get());
+-    const uint32_t n_embd = 256, n_head = 2, n_ff = 384, n_embd_head = n_embd / n_head;
++    const uint32_t n_embd = 256, n_head = 2, n_ff = 384;
++    const uint32_t n_head_attn = getenv("HOSTV_N_HEAD") ? atoi(getenv("HOSTV_N_HEAD")) : 0;
++    const uint32_t n_head_kv   = getenv("HOSTV_N_HEAD_KV") ? atoi(getenv("HOSTV_N_HEAD_KV")) : 1;
++    const uint32_t n_embd_head = n_head_attn > 0 ? 256 : n_embd / n_head;
+ 
+     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,        llm_arch_name(LLM_ARCH_QWEN35));
+     ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab);
+@@ -77,8 +82,15 @@ static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, bool mtp
+     }
+     ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,         n_ff);
+     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,     uint32_t(4));
+-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,        n_head);
+-    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,     uint32_t(1));
++    if (n_head_attn > 0) {
++        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head_attn);
++        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv);
++        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,    n_embd_head);
++        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,  n_embd_head);
++    } else {
++        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head);
++        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, uint32_t(1));
++    }
+     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
+     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,     std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+     ms.add_kv(LLM_KV_SSM_INNER_SIZE,              uint32_t(256));
+@@ -184,6 +196,10 @@ int main(int argc, char ** argv) {
+         if (mtp) {
+             cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+             cp.n_rs_seq = 0;
++            if (getenv("HOSTV_DFT_KV") && std::string(getenv("HOSTV_DFT_KV")) == "q8_0") {
++                cp.type_k = GGML_TYPE_Q8_0;
++                cp.type_v = GGML_TYPE_Q8_0;
++            }
+             p.dft.reset(llama_init_from_model(model.get(), cp));
+             GGML_ASSERT(p.dft);
+             llama_set_embeddings_nextn(p.tgt.get(), true, false);

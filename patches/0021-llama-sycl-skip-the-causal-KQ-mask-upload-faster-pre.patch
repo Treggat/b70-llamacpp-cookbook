@@ -1,0 +1,815 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Mon, 28 Sep 2026 03:13:38 -0600
+Subject: [PATCH 21/27] llama/sycl : skip the causal KQ-mask upload, faster
+ prefill uploads
+
+Prefill at depth was dominated by host->device traffic: an f16 KQ mask
+of n_tokens x n_kv is uploaded per ubatch for the target and again for
+the MTP draft context. All switches default off:
+- LLAMA_KQ_MASK_HINT=1|2|3: tag plain causal masks with their used
+  length (2 = verify each tagged mask on the host, 3 = skip the upload;
+  the device regenerates the mask when a kernel reads it)
+- GGML_SYCL_FA_CAUSAL: prefill attention through oneDNN's implicit
+  bottom-right causal mask when the tag is present
+- GGML_SYCL_H2D_DIRECT: upload from pinned memory without the bounce copy
+- GGML_SYCL_Q6K_DQ_FAST: faster q6_K reorder dequant (bit-identical)
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/include/ggml.h                 |   7 ++
+ ggml/src/ggml-backend.cpp           |  12 ++
+ ggml/src/ggml-sycl/convert.cpp      |  94 ++++++++++++++-
+ ggml/src/ggml-sycl/fattn-onednn.cpp | 171 +++++++++++++++++++++++++---
+ ggml/src/ggml-sycl/fattn-onednn.hpp |   5 +
+ ggml/src/ggml-sycl/fattn.cpp        |  12 ++
+ ggml/src/ggml-sycl/ggml-sycl.cpp    |  13 +++
+ src/llama-kv-cache.cpp              | 108 +++++++++++++++++-
+ tests/test-backend-ops.cpp          | 145 +++++++++++++++++++++++
+ 9 files changed, 547 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 224bdef927..bd95a1f2dc 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2502,6 +2502,13 @@ extern "C" {
+     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
+             const struct ggml_tensor * a);
+ 
++    // LOCAL (prefillx): structure hint a KQ-mask INPUT tensor may carry in its op_params, written by whoever fills the
++    // mask data (llama: the KV cache's set_input_kq_mask) and copied to the backend's copy of the input by
++    // ggml-backend's scheduler with the data: op_params[0] = GGML_KQ_MASK_HINT_CAUSAL, [1] = n_used, [2] = n_rows
++    // means the mask's first n_rows rows are exactly bottom-right causal over KV cells [0, n_used): row i holds 0 for
++    // cells 0 .. n_used - n_rows + i and -inf everywhere else. op_params[0] = 0: no hint. Backends may ignore it.
++    #define GGML_KQ_MASK_HINT_CAUSAL 0x4b514331
++
+     // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+     // n_kv_max must bound the number of finite entries in every mask row.
+     GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 67f519c377..5bd4190bcf 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1854,6 +1854,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
++            // [prefillx] an input's op_params travel with its data (e.g. the KQ-mask structure hint, ggml.h)
++            if (input->op == GGML_OP_NONE) {
++                memcpy(input_cpy->op_params, input->op_params, sizeof(input->op_params));
++                // a KQ mask whose producer marked it as regenerable from its hint (op_params[3] == 1, llama
++                // LLAMA_KQ_MASK_HINT=3) is not uploaded; the consuming backend rebuilds it if it needs the data
++                if (input->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL && input->op_params[3] == 1 &&
++                    input->type == GGML_TYPE_F16 &&
++                    ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    continue;
++                }
++            }
++
+             if (st_beg != SIZE_MAX && ggml_sched_input_stageable(input, input_cpy)) {
+                 // [spechost] staged upload: capture the bytes now, upload from the pinned ring without blocking
+                 const size_t n = ggml_nbytes(input);
+diff --git a/ggml/src/ggml-sycl/convert.cpp b/ggml/src/ggml-sycl/convert.cpp
+index b660b56ab3..a8497cc5c4 100644
+--- a/ggml/src/ggml-sycl/convert.cpp
++++ b/ggml/src/ggml-sycl/convert.cpp
+@@ -1,4 +1,6 @@
+ #include "convert.hpp"
++#include <type_traits>
++#include <vector>
+ #include "dequantize.hpp"
+ #include "presets.hpp"
+ 
+@@ -338,6 +340,96 @@ static void dequantize_row_q6_K_sycl_reorder(const void * vx, dst_t * y, const i
+         [=](sycl::nd_item<3> item_ct1) { dequantize_block_q6_K_reorder(vx, y, item_ct1, nb); });
+ }
+ 
++// LOCAL (prefillx) GGML_SYCL_Q6K_DQ_FAST=1 (default 0): q6_K (reorder layout) -> f16 for the prefill GEMM, 8
++// consecutive outputs per work-item (8-byte ql / qh loads, one 16-byte store) and 8 blocks per 256-item work-group,
++// instead of 4 strided 2-byte stores per item in 64-item groups. Every output is the same expression as
++// dequantize_block_q6_K_reorder (d * sc * (q - 32) with the same operand types), so the result is bit-identical.
++static void dequantize_row_q6_K_sycl_reorder_fast(const void * vx, sycl::half * yy, const int64_t k,
++                                                  dpct::queue_ptr stream) {
++    const int64_t nb = k / QK_K;
++    constexpr int64_t items_per_block = 32;   // 2 halves (ip) x 4 quarters x 4 groups of 8
++    constexpr int64_t wg              = 256;
++    const int64_t     n_items         = nb * items_per_block;
++    stream->parallel_for(sycl::nd_range<1>(((n_items + wg - 1) / wg) * wg, wg), [=](sycl::nd_item<1> it) {
++        const int64_t gid = it.get_global_id(0);
++        if (gid >= n_items) {
++            return;
++        }
++        const int64_t ib  = gid / items_per_block;
++        const int     r   = (int) (gid % items_per_block);
++        const int     ip  = r / 16;          // 0..1: which 128-value half of the block
++        const int     qq  = (r / 4) % 4;     // 0..3: which 32-value quarter of the half
++        const int     il0 = (r % 4) * 8;     // 0, 8, 16, 24: first of 8 consecutive values
++
++        const uint8_t *   base_ptr   = static_cast<const uint8_t *>(vx);
++        const uint8_t *   ql_ptr     = base_ptr + ib * (QK_K / 2);
++        const uint8_t *   qh_ptr     = base_ptr + (QK_K / 2) * nb + (QK_K / 4) * ib;
++        const uint8_t *   scales_ptr = base_ptr + (QK_K / 2) * nb + (QK_K / 4) * nb + (QK_K / 16) * ib;
++        const ggml_half * d          = (const ggml_half *) (base_ptr + ((QK_K / 2) + (QK_K / 4) + (QK_K / 16)) * nb) + ib;
++
++        const int is = 8 * ip + il0 / 16;
++        const int8_t * sc = reinterpret_cast<const int8_t *>(scales_ptr + is);
++
++        const sycl::vec<uint8_t, 8> qlv =
++            *reinterpret_cast<const sycl::vec<uint8_t, 8> *>(ql_ptr + 64 * ip + 32 * (qq & 1) + il0);
++        const sycl::vec<uint8_t, 8> qhv = *reinterpret_cast<const sycl::vec<uint8_t, 8> *>(qh_ptr + 32 * ip + il0);
++
++        sycl::vec<sycl::half, 8> out;
++#pragma unroll
++        for (int e = 0; e < 8; ++e) {
++            const uint8_t ql = qlv[e];
++            const uint8_t qh = qhv[e];
++            sycl::half v;
++            if (qq == 0) {
++                v = *d * sc[0] * ((int8_t) ((ql & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
++            } else if (qq == 1) {
++                v = *d * sc[2] * ((int8_t) ((ql & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
++            } else if (qq == 2) {
++                v = *d * sc[4] * ((int8_t) ((ql >> 4) | (((qh >> 4) & 3) << 4)) - 32);
++            } else {
++                v = *d * sc[6] * ((int8_t) ((ql >> 4) | (((qh >> 6) & 3) << 4)) - 32);
++            }
++            out[e] = v;
++        }
++        *reinterpret_cast<sycl::vec<sycl::half, 8> *>(yy + ib * QK_K + 128 * ip + 32 * qq + il0) = out;
++    });
++}
++
++template <typename dst_t>
++static void dequantize_row_q6_K_sycl_reorder_sel(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
++    static const bool fast = [] {
++        const char * e = getenv("GGML_SYCL_Q6K_DQ_FAST");
++        return e && atoi(e) != 0;
++    }();
++    if constexpr (std::is_same_v<dst_t, sycl::half>) {
++        if (fast && (k % QK_K) == 0 && ((uintptr_t) vx) % 8 == 0 && ((uintptr_t) y) % 16 == 0) {
++            dequantize_row_q6_K_sycl_reorder_fast(vx, y, k, stream);
++            // GGML_SYCL_Q6K_DQ_FAST=2 (test): also run the reference kernel and compare bit for bit (syncs)
++            static const bool verify = [] { const char * e = getenv("GGML_SYCL_Q6K_DQ_FAST"); return e && atoi(e) == 2; }();
++            if (verify) {
++                sycl::half * ref = sycl::malloc_device<sycl::half>(k, *stream);
++                dequantize_row_q6_K_sycl_reorder(vx, ref, k, stream);
++                std::vector<uint16_t> a(k), b(k);
++                stream->memcpy(a.data(), y, k * sizeof(uint16_t));
++                stream->memcpy(b.data(), ref, k * sizeof(uint16_t)).wait();
++                sycl::free(ref, *stream);
++                int64_t bad = 0;
++                for (int64_t i = 0; i < k; ++i) {
++                    bad += a[i] != b[i];
++                }
++                static int n_log = 0;
++                if (bad != 0 || n_log++ < 4) {
++                    fprintf(stderr, "GGML_SYCL_Q6K_DQ_FAST=2: %lld values, %lld differ\n", (long long) k, (long long) bad);
++                }
++                GGML_ASSERT(bad == 0);
++            }
++            return;
++        }
++    }
++    dequantize_row_q6_K_sycl_reorder(vx, y, k, stream);
++}
++
++
+ template <typename dst_t>
+ static void dequantize_row_iq1_s_sycl(const void *vx, dst_t *y, const int64_t k,
+                                         dpct::queue_ptr stream) {
+@@ -705,7 +797,7 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
+             }
+         case GGML_TYPE_Q6_K:
+             if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+-                return dequantize_row_q6_K_sycl_reorder;
++                return dequantize_row_q6_K_sycl_reorder_sel;
+             } else {
+                 return dequantize_row_q6_K_sycl;
+             }
+diff --git a/ggml/src/ggml-sycl/fattn-onednn.cpp b/ggml/src/ggml-sycl/fattn-onednn.cpp
+index b2c19fb8ac..2e5d501e7b 100644
+--- a/ggml/src/ggml-sycl/fattn-onednn.cpp
++++ b/ggml/src/ggml-sycl/fattn-onednn.cpp
+@@ -1,4 +1,6 @@
+ #include <array>
++#include <chrono>
++#include <cmath>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+@@ -113,6 +115,35 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
+ #endif
+ }
+ 
++void ggml_sycl_fa_mask_ensure(ggml_backend_sycl_context & ctx, const ggml_tensor * mask_c) {
++    if (!mask_c || mask_c->op_params[0] != GGML_KQ_MASK_HINT_CAUSAL || mask_c->op_params[3] != 1) {
++        return;
++    }
++    // test hook (negative control of the GGML_SYCL_FA_MASK_POISON test): PX_NO_ENSURE=1 skips the rebuild
++    static const bool no_ensure = getenv("PX_NO_ENSURE") != nullptr;
++    if (no_ensure) {
++        return;
++    }
++    ggml_tensor * mask = const_cast<ggml_tensor *>(mask_c);   // the flag lives in the host-side tensor struct
++    GGML_ASSERT(mask->type == GGML_TYPE_F16);
++    const int64_t n_used = mask->op_params[1];
++    const int64_t n_rows = mask->op_params[2];
++    const int64_t ne0 = mask->ne[0], ne1 = mask->ne[1], ne2 = mask->ne[2], ne3 = mask->ne[3];
++    const size_t  nb1 = mask->nb[1], nb2 = mask->nb[2], nb3 = mask->nb[3];
++    char * base = (char *) mask->data;
++    const int64_t n = ne0 * ne1 * ne2 * ne3;
++    const sycl::half zero = sycl::half(0.0f), ninf = sycl::half(-INFINITY);
++    ctx.stream()->parallel_for(sycl::range<1>(n), [=](sycl::id<1> ix) {
++        int64_t i = ix[0];
++        const int64_t i0 = i % ne0; i /= ne0;
++        const int64_t i1 = i % ne1; i /= ne1;
++        const int64_t i2 = i % ne2; const int64_t i3 = i / ne2;
++        const int64_t last = i1 < n_rows ? n_used - n_rows + i1 : -1;
++        *(sycl::half *) (base + i3 * nb3 + i2 * nb2 + i1 * nb1 + i0 * sizeof(sycl::half)) = i0 <= last ? zero : ninf;
++    });
++    mask->op_params[3] = 2;
++}
++
+ #if GGML_SYCL_DNNL
+ 
+ #include "dnnl.hpp"
+@@ -158,13 +189,47 @@ struct sdpa_partition {
+     std::vector<logical_tensor> ins;
+     logical_tensor              out;
+     size_t id_q = 0, id_k = 0, id_v = 0, id_scale = 0, id_mask = 0;
++    // LOCAL (prefillx) implicit bottom-right causal mask: host-scalar inputs
++    size_t id_kvlen = SIZE_MAX, id_qlen = SIZE_MAX, id_ninf = SIZE_MAX;
+     bool   ok = false;
+ };
+ 
++// LOCAL (prefillx): GGML_SYCL_FA_CAUSAL=1 (default 0). When the KQ mask carries the GGML_KQ_MASK_HINT_CAUSAL hint
++// (llama sets it on a prefill ubatch whose mask is exactly bottom-right causal over the first n_used KV cells), the
++// SDPA runs with oneDNN's implicit bottom-right causal mask over K/V cut to n_used cells instead of adding the
++// explicit mask: no n_q x n_kv mask read per head, and the key loop of each query tile stops at the diagonal. The
++// same scores, max and exp terms as the explicit mask (a 0 added is exact, a -inf term contributes 0); only
++// oneDNN's kernel choice / tiling for the causal variant can change the summation order (rounding level).
++static bool ggml_sycl_fa_causal_env() {
++    static const bool v = [] {
++        const char * e = getenv("GGML_SYCL_FA_CAUSAL");
++        return e && atoi(e) != 0;
++    }();
++    return v;
++}
++
++// n_used from the mask hint when the causal variant applies to this op, else 0
++static int64_t ggml_sycl_fa_causal_n_used(const ggml_tensor * mask, int64_t n_q, int64_t n_kv) {
++    if (!mask || !ggml_sycl_fa_causal_env()) {
++        return 0;
++    }
++    const int32_t * p = mask->op_params;
++    if (p[0] != GGML_KQ_MASK_HINT_CAUSAL) {
++        return 0;
++    }
++    const int64_t n_used = p[1];
++    const int64_t n_rows = p[2];
++    if (n_rows != n_q || mask->ne[1] < n_q || n_used < n_q || n_used > n_kv) {
++        return 0;
++    }
++    return n_used;
++}
++
+ // Build + compile the contiguous-input GQA SDPA graph (MatMul->Divide->Add->SoftMax->MatMul), f32 out.
+ // Mirrors the hardware-verified scratch/onednn_sdpa_probe.cpp build_gqa (partitions=1, sdp_primitive_kernel_t).
+ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int seq, int d,
+-                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str) try {
++                                 const std::array<int64_t, 5> & k_str, const std::array<int64_t, 5> & v_str,
++                                 bool causal = false) try {
+     using ltype = logical_tensor::layout_type;
+     using dt    = logical_tensor::data_type;
+     using ldims = logical_tensor::dims;
+@@ -193,11 +258,38 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int
+     auto madd   = op(id++, op::kind::Add, "mask_add");
+     madd.add_inputs({scaled, mask}); madd.add_outputs({masked});
+ 
++    // LOCAL (prefillx) implicit bottom-right causal mask (oneDNN's sdpa_bottom_right_causal_mask pattern):
++    // keep score[r][c] iff r + seq_len_kv - seq_len_q >= c, else -inf
++    using ptype = logical_tensor::property_type;
++    auto idx_row  = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
++    auto gi_row   = op(id++, op::kind::GenIndex, "gen_index_row");
++    gi_row.set_attr<int64_t>(op::attr::axis, -2);
++    gi_row.add_inputs({scaled}); gi_row.add_outputs({idx_row});
++    auto kvlen    = logical_tensor(id++, dt::s32, 0, ltype::strided, ptype::host_scalar);
++    auto r_add    = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
++    auto cadd     = op(id++, op::kind::Add, "causal_add");
++    cadd.add_inputs({idx_row, kvlen}); cadd.add_outputs({r_add});
++    auto qlen     = logical_tensor(id++, dt::s32, 0, ltype::strided, ptype::host_scalar);
++    auto r_sub    = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
++    auto csub     = op(id++, op::kind::Subtract, "causal_sub");
++    csub.add_inputs({r_add, qlen}); csub.add_outputs({r_sub});
++    auto idx_col  = logical_tensor(id++, dt::s32, s_sz, ltype::strided);
++    auto gi_col   = op(id++, op::kind::GenIndex, "gen_index_col");
++    gi_col.set_attr<int64_t>(op::attr::axis, -1);
++    gi_col.add_inputs({scaled}); gi_col.add_outputs({idx_col});
++    auto keep     = logical_tensor(id++, dt::boolean, s_sz, ltype::strided);
++    auto cge      = op(id++, op::kind::GreaterEqual, "causal_ge");
++    cge.add_inputs({r_sub, idx_col}); cge.add_outputs({keep});
++    auto ninf     = logical_tensor(id++, fi, 0, ltype::strided, ptype::host_scalar);
++    auto cmasked  = logical_tensor(id++, fi, s_sz, ltype::strided);
++    auto csel     = op(id++, op::kind::Select, "causal_select");
++    csel.add_inputs({keep, scaled, ninf}); csel.add_outputs({cmasked});
++
+     auto probs  = logical_tensor(id++, t,  s_sz, ltype::strided);
+     auto smax   = op(id++, op::kind::SoftMax, "softmax");
+     smax.set_attr<int64_t>(op::attr::axis, -1);
+     smax.set_attr<std::string>(op::attr::mode, "inf_as_zero");
+-    smax.add_inputs({masked}); smax.add_outputs({probs});
++    smax.add_inputs({causal ? cmasked : masked}); smax.add_outputs({probs});
+ 
+     auto value  = logical_tensor(id++, t,  kv_sz, v_st);
+     // f16 output is REQUIRED to hit sdp_primitive_kernel_t (the systolic micro-kernel); an f32 output
+@@ -208,12 +300,18 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int
+     bmm2.add_inputs({probs, value}); bmm2.add_outputs({output});
+ 
+     dnnl::graph::graph g(eng.get_kind());
+-    g.add_op(bmm1); g.add_op(sdiv); g.add_op(madd); g.add_op(smax); g.add_op(bmm2);
++    g.add_op(bmm1); g.add_op(sdiv);
++    if (causal) {
++        g.add_op(gi_row); g.add_op(cadd); g.add_op(csub); g.add_op(gi_col); g.add_op(cge); g.add_op(csel);
++    } else {
++        g.add_op(madd);
++    }
++    g.add_op(smax); g.add_op(bmm2);
+     g.finalize();
+ 
+     auto parts = g.get_partitions();
+     if (parts.size() != 1 || !parts[0].is_supported()) {
+-        GGML_LOG_WARN("%s: oneDNN did not fuse the SDPA graph; falling back to TILE kernel\n", __func__);
++        GGML_LOG_WARN("%s: oneDNN did not fuse the SDPA graph%s; falling back\n", __func__, causal ? " (causal)" : "");
+         return E;   // ok stays false -> caller falls back to TILE
+     }
+     E.ins      = parts[0].get_input_ports();
+@@ -222,6 +320,10 @@ static sdpa_partition build_sdpa(const engine & eng, int H, int Hkv, int q, int
+     E.out      = E.cp.query_logical_tensor(E.out.get_id());
+     E.id_q     = query.get_id(); E.id_k = key.get_id(); E.id_v = value.get_id();
+     E.id_scale = scale.get_id(); E.id_mask = mask.get_id();
++    if (causal) {
++        E.id_mask  = SIZE_MAX;
++        E.id_kvlen = kvlen.get_id(); E.id_qlen = qlen.get_id(); E.id_ninf = ninf.get_id();
++    }
+     E.ok       = true;
+     return E;
+ }
+@@ -399,16 +501,44 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
+     // compile once per (device, shape, KV strides), reuse across layers/calls. Stride 2 always
+     // repeats stride 1 and stride 4 is always 1, so the key covers every entry that can differ.
+     static std::unordered_map<std::string, sdpa_partition> cache;
+-    char keyb[256];
+-    snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld", ggml_sycl_get_device(),
+-             (long long) H, (long long) Hkv, (long long) q, (long long) seq, (long long) d,
+-             (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
+-             (long long) v_str[0], (long long) v_str[1], (long long) v_str[3]);
+-    auto it = cache.find(keyb);
+-    if (it == cache.end()) {
+-        it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) seq, (int) d, k_str, v_str)).first;
++    auto get_partition = [&](int64_t n_seq, bool causal) -> sdpa_partition & {
++        char keyb[256];
++        snprintf(keyb, sizeof(keyb), "%d:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%lld:%d", ggml_sycl_get_device(),
++                 (long long) H, (long long) Hkv, (long long) q, (long long) n_seq, (long long) d,
++                 (long long) k_str[0], (long long) k_str[1], (long long) k_str[3],
++                 (long long) v_str[0], (long long) v_str[1], (long long) v_str[3], (int) causal);
++        auto it = cache.find(keyb);
++        if (it == cache.end()) {
++            // LOCAL (prefillx) GGML_SYCL_FA_ONEDNN_LOG=1: host time of each partition build + compile
++            static const bool log_build = getenv("GGML_SYCL_FA_ONEDNN_LOG") != nullptr;
++            const auto t0 = std::chrono::steady_clock::now();
++            it = cache.emplace(keyb, build_sdpa(eng, (int) H, (int) Hkv, (int) q, (int) n_seq, (int) d, k_str, v_str,
++                                                causal)).first;
++            if (log_build) {
++                GGML_LOG_INFO("%s: SDPA partition q=%lld seq=%lld causal=%d built in %.1f ms (ok=%d, %zu cached)\n",
++                              __func__, (long long) q, (long long) n_seq, (int) causal,
++                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
++                              (int) it->second.ok, cache.size());
++            }
++        }
++        return it->second;
++    };
++    // LOCAL (prefillx) GGML_SYCL_FA_CAUSAL: the implicit-causal partition over the first n_used cells (the K/V
++    // pointers and strides stay those of the n_kv-cell tensors; only the sequence dimension shrinks), else the
++    // explicit-mask partition over all n_kv cells
++    const int64_t n_used = ggml_sycl_fa_causal_n_used(mask, q, seq);
++    sdpa_partition * Ep = nullptr;
++    if (n_used > 0) {
++        sdpa_partition & Ec = get_partition(n_used, true);
++        if (Ec.ok) {
++            Ep = &Ec;
++        }
++    }
++    if (Ep == nullptr) {
++        ggml_sycl_fa_mask_ensure(ctx, mask);   // the explicit-mask partition reads the mask
++        Ep = &get_partition(seq, false);
+     }
+-    sdpa_partition & E = it->second;
++    sdpa_partition & E = *Ep;
+     if (!E.ok) {
+         // oneDNN can decline a shape or a stride set that _supported() never sees; build_sdpa warns per key.
+         ggml_sycl_flash_attn_ext_tile(ctx, dst);
+@@ -425,8 +555,20 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
+     };
+     std::vector<tensor> ti;
+     ti.reserve(E.ins.size());
++    int32_t kvlen_v = (int32_t) n_used;
++    int32_t qlen_v  = (int32_t) q;
++    float   ninf_v  = -INFINITY;
+     for (auto & lt : E.ins) {
+-        ti.emplace_back(lt, eng, id2ptr(lt.get_id()));
++        const size_t lid = lt.get_id();
++        if (lid == E.id_kvlen) {
++            ti.push_back(tensor::make_scalar_tensor(lt, &kvlen_v));
++        } else if (lid == E.id_qlen) {
++            ti.push_back(tensor::make_scalar_tensor(lt, &qlen_v));
++        } else if (lid == E.id_ninf) {
++            ti.push_back(tensor::make_scalar_tensor(lt, &ninf_v));
++        } else {
++            ti.emplace_back(lt, eng, id2ptr(lid));
++        }
+     }
+     tensor to(E.out, eng, outf_ptr);
+     E.cp.execute(strm, ti, {to});
+@@ -449,6 +591,7 @@ catch (const std::exception & e) {
+     }
+     // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).
+     GGML_LOG_WARN("%s: oneDNN SDPA failed (%s); falling back to TILE kernel\n", __func__, e.what());
++    ggml_sycl_fa_mask_ensure(ctx, dst->src[3]);
+     ggml_sycl_flash_attn_ext_tile(ctx, dst);
+ }
+ 
+diff --git a/ggml/src/ggml-sycl/fattn-onednn.hpp b/ggml/src/ggml-sycl/fattn-onednn.hpp
+index 9669d1bd27..d3ee552e76 100644
+--- a/ggml/src/ggml-sycl/fattn-onednn.hpp
++++ b/ggml/src/ggml-sycl/fattn-onednn.hpp
+@@ -15,4 +15,9 @@ bool ggml_sycl_fattn_onednn_binds_kv(const ggml_tensor * K, const ggml_tensor *
+ // execute the cached SDPA partition, write the f32 dst. Falls back to the TILE kernel on any failure.
+ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+ 
++// LOCAL (prefillx): a KQ mask carrying the GGML_KQ_MASK_HINT_CAUSAL hint with op_params[3] == 1 was not uploaded by the
++// scheduler (llama LLAMA_KQ_MASK_HINT=3); rebuild its data on the device from the hint before a kernel reads it
++// (op_params[3] = 2 afterwards). No-op for any other mask.
++void ggml_sycl_fa_mask_ensure(ggml_backend_sycl_context & ctx, const ggml_tensor * mask);
++
+ #endif // GGML_SYCL_FATTN_ONEDNN_HPP
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+index 2dceccaff2..364ec7892b 100644
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -317,6 +317,18 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
+     }
+ 
+     const best_fattn_kernel fk = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
++    // LOCAL (prefillx) test hook GGML_SYCL_FA_MASK_POISON=1: NaN-fill a hinted, not-uploaded mask first, so any kernel
++    // reading it without regenerating it produces NaNs
++    static const bool poison = ggml_sycl_get_env("GGML_SYCL_FA_MASK_POISON", 0) != 0;
++    if (poison && dst->src[3] && dst->src[3]->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL && dst->src[3]->op_params[3] == 1) {
++        const ggml_tensor * m = dst->src[3];
++        ctx.stream()->fill((sycl::half *) m->data, sycl::half(NAN), ggml_nbytes(m) / sizeof(sycl::half));
++    }
++    // LOCAL (prefillx): a hinted mask that was not uploaded is rebuilt on the device for every kernel that reads it
++    // (the oneDNN path decides for itself: its implicit-causal partition does not read the mask)
++    if (fk != BEST_FATTN_KERNEL_ONEDNN) {
++        ggml_sycl_fa_mask_ensure(ctx, dst->src[3]);
++    }
+     switch (fk) {
+         case BEST_FATTN_KERNEL_NONE:
+             GGML_ABORT("Not support Flash-Attention");
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 7b0addeafc..0c3df94534 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -740,6 +740,19 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
+     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
+ #ifndef _WIN32
++    // LOCAL (prefillx) GGML_SYCL_H2D_DIRECT=1 (default 0): a source in USM host (pinned) memory - llama's graph-input
++    // buffers, i.e. every per-ubatch KQ mask - is copied to the device directly. The malloc + memcpy bounce below (a PVC
++    // workaround for mmap'ed model files) turns that pinned upload into a pageable one: ~2.2 GB/s measured on the B70,
++    // ~78 ms for the 172 MB mask of a 2048-token ubatch at 42k cells, per context. =2: every source directly (probe only)
++    static const int h2d_direct = [] {
++        const char * e = getenv("GGML_SYCL_H2D_DIRECT");
++        return e ? atoi(e) : 0;
++    }();
++    if (h2d_direct >= 2 ||
++        (h2d_direct == 1 && sycl::get_pointer_type(data, stream->get_context()) == sycl::usm::alloc::host)) {
++        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
++        return;
++    }
+     // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
+     // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
+     char * host_buf = (char *) malloc(size);
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index a34e21bf86..29533daf8f 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1808,9 +1808,34 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+     }
+ }
+ 
++// [prefillx] env LLAMA_KQ_MASK_HINT=1 (default 0): tag a prefill ubatch's KQ mask with GGML_KQ_MASK_HINT_CAUSAL (see ggml.h)
++// when it is exactly bottom-right causal over the first n_used KV cells, so a backend can run the attention with an
++// implicit causal mask (SYCL: GGML_SYCL_FA_CAUSAL). Checked from the cell positions in O(n_kv) per ubatch: one sequence,
++// every used cell carries it, cells 0 .. n_used-1 used with strictly increasing positions (no repeated M-RoPE image
++// positions), cells n_used .. n_kv-1 empty, and the ubatch's tokens are the last n_tokens used cells in order.
++// LLAMA_KQ_MASK_HINT=2 also scans every tagged mask against the hint and aborts on any difference (test mode).
++// LLAMA_KQ_MASK_HINT=3 also marks the tagged f16 mask as not needing an upload (op_params[3] = 1, see below).
++static int llama_kq_mask_hint_mode() {
++    static const int mode = [] {
++        const char * e = getenv("LLAMA_KQ_MASK_HINT");
++        return e ? atoi(e) : 0;
++    }();
++    return mode;
++}
++
++// minimum ubatch size that gets the hint (the SYCL oneDNN attention serves >= 32 query tokens; smaller batches
++// keep op_params stable for the SYCL graph cache)
++static constexpr uint32_t LLAMA_KQ_MASK_HINT_MIN_TOKENS = 32;
++
+ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+     const uint32_t n_tokens = ubatch->n_tokens;
+ 
++    // [prefillx] no hint unless proven below
++    dst->op_params[0] = 0;
++    dst->op_params[1] = 0;
++    dst->op_params[2] = 0;
++    dst->op_params[3] = 0;
++
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const int64_t n_kv     = dst->ne[0];
+@@ -1843,13 +1868,86 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+         /*.fast             =*/ llama_kq_mask_fast_mode() > 0,
+     };
+ 
+-    if (dst->type == GGML_TYPE_F16) {
+-        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+-    } else {
+-        set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
++    // [prefillx] structure hint (from the cell positions, before the fill)
++    bool    hinted = false;
++    int64_t n_used = 0;
++    if (llama_kq_mask_hint_mode() > 0 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
++        n_stream == 1 && n_tokens >= LLAMA_KQ_MASK_HINT_MIN_TOKENS) {
++        const llama_seq_id s0 = ubatch->seq_id[0][0];
++        bool ok = true;
++        for (uint32_t i = 0; i < n_tokens && ok; ++i) {
++            ok = ubatch->n_seq_id[i] == 1 && ubatch->seq_id[i][0] == s0;
++        }
++        const auto & cells = v_cells.at(seq_to_stream[s0]);
++        ok = ok && cells.get_used() == cells.seq_n_cells(s0) && (int64_t) cells.size() >= n_kv;
++        if (ok) {
++            const llama_pos * P = cells.pos_data();
++            while (n_used < n_kv && P[n_used] >= 0) {
++                if (n_used > 0 && P[n_used] <= P[n_used - 1]) {
++                    ok = false;
++                    break;
++                }
++                n_used++;
++            }
++            for (int64_t j = n_used; ok && j < n_kv; ++j) {
++                ok = P[j] < 0;
++            }
++            ok = ok && n_used >= (int64_t) n_tokens;
++            for (uint32_t i = 0; ok && i < n_tokens; ++i) {
++                ok = P[n_used - n_tokens + i] == ubatch->pos[i];
++            }
++        }
++        if (ok) {
++            hinted = true;
++            dst->op_params[0] = GGML_KQ_MASK_HINT_CAUSAL;
++            dst->op_params[1] = (int32_t) n_used;
++            dst->op_params[2] = (int32_t) n_tokens;
++            // mode 3 (f16 = flash-attention masks only): the backend may regenerate the mask from the hint, so the
++            // scheduler skips the upload (ggml-backend.cpp; SYCL rebuilds it on the device if a kernel needs the data)
++            dst->op_params[3] = (llama_kq_mask_hint_mode() == 3 && dst->type == GGML_TYPE_F16) ? 1 : 0;
++        }
++    }
++
++    // [prefillx] LLAMA_KQ_MASK_HINT_NOFILL=1 (with LLAMA_KQ_MASK_HINT=3): skip the host fill of a mask that is not
++    // uploaded. Only safe when no CPU-side op reads the mask (the scheduler keeps FLASH_ATTN_EXT on the GPU)
++    static const bool nofill = [] {
++        const char * e = getenv("LLAMA_KQ_MASK_HINT_NOFILL");
++        return e && atoi(e) != 0;
++    }();
++    const bool filled = !(nofill && hinted && dst->op_params[3] == 1);
++
++    if (filled) {
++        if (dst->type == GGML_TYPE_F16) {
++            set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
++        } else {
++            set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
++        }
++    }
++
++    if (llama_kq_mask_hint_mode() == 2 && n_tokens >= LLAMA_KQ_MASK_HINT_MIN_TOKENS) {
++        static int64_t n_tagged = 0, n_untagged = 0;
++        (hinted ? n_tagged : n_untagged)++;
++        if (hinted) {
++            const bool f16 = dst->type == GGML_TYPE_F16;
++            for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
++                const int64_t last = n_used - n_tokens + i;
++                for (int64_t j = 0; j < n_kv; ++j) {
++                    const float v = f16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) dst->data)[i*n_kv + j])
++                                        : ((const float *) dst->data)[i*n_kv + j];
++                    if ((j <= last) ? (v != 0.0f) : (v != -INFINITY)) {
++                        GGML_ABORT("LLAMA_KQ_MASK_HINT mismatch at row %lld col %lld (n_used %lld, n_kv %lld)",
++                                   (long long) i, (long long) j, (long long) n_used, (long long) n_kv);
++                    }
++                }
++            }
++        }
++        if (((n_tagged + n_untagged) & (n_tagged + n_untagged - 1)) == 0) {
++            LLAMA_LOG_INFO("%s: LLAMA_KQ_MASK_HINT=2: %lld masks tagged and verified, %lld untagged (n_kv = %lld, n_used = %lld)\n",
++                           __func__, (long long) n_tagged, (long long) n_untagged, (long long) n_kv, (long long) n_used);
++        }
+     }
+ 
+-    if (llama_kq_mask_fast_mode() == 2) {
++    if (llama_kq_mask_fast_mode() == 2 && filled) {
+         // test mode: rebuild with the reference path and compare bit for bit
+         std::vector<uint8_t> ref(ggml_nbytes(dst));
+         args_set_input_kq_mask args_ref = args;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ca53f0c7c3..7ca29a4fdc 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -189,6 +189,25 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
+     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+ }
+ 
++// LOCAL (prefillx): bottom-right causal prefill mask: row i (i < n_q) sees KV cells 0 .. n_used - n_q + i, where
++// n_used = ne0 - pad; padded rows (i >= n_q) see nothing but cell 0
++static void init_tensor_kq_mask_causal(ggml_tensor * tensor, int64_t n_q, int64_t pad) {
++    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
++    GGML_TENSOR_LOCALS( int64_t, ne, tensor, ne);
++    const int64_t n_used = ne0 - pad;
++    GGML_ASSERT(n_used >= n_q);
++    std::vector<ggml_fp16_t> d((size_t) ne0*ne1*ne2*ne3);
++    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
++    for (int64_t i3 = 0; i3 < ne3; i3++) for (int64_t i2 = 0; i2 < ne2; i2++) for (int64_t i1 = 0; i1 < ne1; i1++) {
++        ggml_fp16_t * row = d.data() + ((i3*ne2 + i2)*ne1 + i1)*ne0;
++        const int64_t last = i1 < n_q ? n_used - n_q + i1 : 0;
++        for (int64_t i0 = 0; i0 < ne0; i0++) {
++            row[i0] = i0 <= last ? zero : ninf;
++        }
++    }
++    ggml_backend_tensor_set(tensor, d.data(), 0, d.size()*sizeof(ggml_fp16_t));
++}
++
+ static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
+     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+     GGML_ASSERT(n_kv_max > 0 && n_kv_max <= tensor->ne[0]);
+@@ -1667,12 +1686,66 @@ struct test_case {
+         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+         ggml_build_forward_expand(gf, out);
+ 
++        // LOCAL (prefillx): TBO_H2D=1 times a host -> device upload (pageable std::vector) of every input tensor
++        // >= 16 MB, e.g. the KQ mask a prefill ubatch uploads
++        if (getenv("TBO_H2D")) {
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (t->op != GGML_OP_NONE || t->view_src || !t->buffer || ggml_nbytes(t) < (16u << 20)) {
++                    continue;
++                }
++                std::vector<uint8_t> hb(ggml_nbytes(t));
++                ggml_backend_tensor_get(t, hb.data(), 0, hb.size());
++                double best = 1e30;
++                for (int r = 0; r < 3; ++r) {
++                    ggml_backend_synchronize(backend);
++                    const int64_t t0 = ggml_time_us();
++                    ggml_backend_tensor_set(t, hb.data(), 0, hb.size());
++                    ggml_backend_synchronize(backend);
++                    best = std::min(best, (double) (ggml_time_us() - t0));
++                }
++                printf("  [h2d %s %s %.1f MB: %.2f ms, %.1f GB/s]\n", current_op_name.c_str(), ggml_type_name(t->type),
++                       hb.size() / 1e6, best / 1e3, hb.size() / best / 1e3);
++                // the same from the device's pinned host buffer type (what llama's input buffers use when available)
++                ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
++                if (hbt) {
++                    ggml_backend_buffer_t pb = ggml_backend_buft_alloc_buffer(hbt, hb.size());
++                    if (pb) {
++                        void * pp = ggml_backend_buffer_get_base(pb);
++                        memcpy(pp, hb.data(), hb.size());
++                        double bp = 1e30;
++                        for (int r = 0; r < 3; ++r) {
++                            ggml_backend_synchronize(backend);
++                            const int64_t t0 = ggml_time_us();
++                            ggml_backend_tensor_set(t, pp, 0, hb.size());
++                            ggml_backend_synchronize(backend);
++                            bp = std::min(bp, (double) (ggml_time_us() - t0));
++                        }
++                        printf("  [h2d-pinned %s %.1f MB: %.2f ms, %.1f GB/s]\n", current_op_name.c_str(), hb.size() / 1e6,
++                               bp / 1e3, hb.size() / bp / 1e3);
++                        ggml_backend_buffer_free(pb);
++                    }
++                }
++            }
++        }
++
+         // warmup run
++        const int64_t t_warm0 = ggml_time_us();
+         ggml_status status = ggml_backend_graph_compute(backend, gf);
+         if (status != GGML_STATUS_SUCCESS) {
+             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+             return false;
+         }
++        // LOCAL (prefillx): TBO_WARMUP_MS=1 prints the first (warmup) run's wall time: kernel JIT / oneDNN primitive or
++        // SDPA partition compile for a new shape shows up here, not in the timed runs
++        if (getenv("TBO_WARMUP_MS")) {
++            ggml_backend_synchronize(backend);
++            const int64_t t_warm1 = ggml_time_us();
++            ggml_status s2 = ggml_backend_graph_compute(backend, gf);
++            ggml_backend_synchronize(backend);
++            printf("  [warmup %s: first %.2f ms, second %.2f ms]\n", current_op_name.c_str(), (t_warm1 - t_warm0) / 1e3,
++                   (ggml_time_us() - t_warm1) / 1e3);
++            GGML_UNUSED(s2);
++        }
+ 
+         // determine number of runs
+         int n_runs;
+@@ -8131,6 +8204,22 @@ struct test_flash_attn_ext : public test_case {
+             } else if (strcmp(t->name, "m") == 0) {
+                 if (n_kv_max > 0) {
+                     init_tensor_kq_mask_sparse(t, n_kv_max);
++                } else if (getenv("TBO_FA_CAUSAL") && kv - (getenv("TBO_FA_CAUSAL_PAD") ? atoi(getenv("TBO_FA_CAUSAL_PAD")) : 0) >= nb) {
++                    // LOCAL (prefillx): a real prefill mask, the ubatch's nb tokens at the end of the used KV
++                    // (bottom-right causal), the last TBO_FA_CAUSAL_PAD cells unused (-inf); 0 / -inf only, as llama
++                    // builds it
++                    const int pad = getenv("TBO_FA_CAUSAL_PAD") ? atoi(getenv("TBO_FA_CAUSAL_PAD")) : 0;
++                    init_tensor_kq_mask_causal(t, nb, pad);
++                    // and the structure hint llama would attach (TBO_FA_CAUSAL=2: no hint, explicit mask only)
++                    if (atoi(getenv("TBO_FA_CAUSAL")) != 2) {
++                        t->op_params[0] = GGML_KQ_MASK_HINT_CAUSAL;
++                        t->op_params[1] = (int32_t) (t->ne[0] - pad);
++                        t->op_params[2] = (int32_t) nb;
++                        // TBO_FA_CAUSAL=3: also "not uploaded" (llama LLAMA_KQ_MASK_HINT=3); with SYCL
++                        // GGML_SYCL_FA_MASK_POISON=1 the backend's copy is poisoned, so a kernel that reads it without
++                        // regenerating it fails
++                        t->op_params[3] = atoi(getenv("TBO_FA_CAUSAL")) == 3 ? 1 : 0;
++                    }
+                 } else {
+                     init_tensor_kq_mask(t);
+                 }
+@@ -11578,6 +11667,62 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // LOCAL (prefillx): every op class of one house-model prefill ubatch (Qwen3.8-27B qwen35 Q4_K_M: 48 gated-delta
++    // + 16 attention layers + the MTP layer) at 512 / 1024 / 2048 tokens and KV depth 0 / 32k / 64k / 96k. env
++    // PREFILLX_ONLY=1 keeps just these (the rest of the perf list is skipped); PREFILLX_NC="2048" narrows the token counts
++    // PREFILLX_FA_SWEEP="nb:kv0:kv1:step" instead: only the f16 attention of an nb-token ubatch at kv = kv0..kv1
++    if (const char * e = getenv("PREFILLX_FA_SWEEP")) {
++        int nb = 2048, kv0 = 2048, kv1 = 100352, step = 2048;
++        sscanf(e, "%d:%d:%d:%d", &nb, &kv0, &kv1, &step);
++        for (int kv = kv0; kv <= kv1; kv += step) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
++                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
++        }
++        return test_cases;
++    }
++    if (getenv("PREFILLX_ONLY")) {
++        std::vector<int> ncs = { 512, 1024, 2048 };
++        if (const char * e = getenv("PREFILLX_NC")) {
++            ncs.clear();
++            for (const char * p = e; *p; ) { ncs.push_back(atoi(p)); while (*p && *p != ',') { p++; } if (*p) { p++; } }
++        }
++        for (int nc : ncs) {
++            // weights as the model has them (M x K, type): q4_K everywhere, q6_K for half the ffn_down / GDN attn_qkv /
++            // attn_v; 5120 x 10240 = the MTP eh_proj; 48 x 5120 = ssm_alpha / ssm_beta
++            for (auto [nw, kw, t] : std::vector<std::tuple<int,int,ggml_type>>{
++                     {17408, 5120, GGML_TYPE_Q4_K}, {5120, 17408, GGML_TYPE_Q4_K}, {5120, 17408, GGML_TYPE_Q6_K},
++                     {10240, 5120, GGML_TYPE_Q4_K}, {10240, 5120, GGML_TYPE_Q6_K}, {6144, 5120, GGML_TYPE_Q4_K},
++                     {5120, 6144, GGML_TYPE_Q4_K}, {12288, 5120, GGML_TYPE_Q4_K}, {1024, 5120, GGML_TYPE_Q4_K},
++                     {1024, 5120, GGML_TYPE_Q6_K}, {5120, 10240, GGML_TYPE_Q4_K}, {48, 5120, GGML_TYPE_Q4_K} }) {
++                test_cases.emplace_back(new test_mul_mat_prefill(t, nw, nc, kw));
++            }
++            // the GEMM alone on f16 weights (ceiling of the dequant + GEMM path)
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 17408, nc, 5120, { 1, 1 }, { 1, 1 }));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 5120, nc, 17408, { 1, 1 }, { 1, 1 }));
++            // attention: the ubatch over depth d + itself (n_kv padded to 256), f16 target KV, q8_0 MTP draft KV
++            for (int depth : { 0, 32768, 65536, 98304 }) {
++                const int kv = GGML_PAD(depth + nc, 256);
++                for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nc, true, false, 0, 0,
++                                            GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
++                }
++            }
++            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nc, 1, 3, false, false, 1));
++            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {5120, nc, 1, 1}, 1e-6f));
++            test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {5120, nc, 1, 1}, false, 1e-6f));
++            test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {5120, nc, 1, 1}, {1, 1, 1, 1}));
++            test_cases.emplace_back(new test_bin_bcast(ggml_mul, GGML_TYPE_F32, {6144, nc, 1, 1}, {1, 1, 1, 1}));
++            test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {3 + nc, 10240, 1, 1}, {4, 10240, 1, 1}, false));
++            test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, {17408, nc, 1, 1}, 0));
++            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {128, 16, nc, 1}, 1e-6f, false));
++            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { 1024, 131072, 1, 1 }, { 1, 1 }, nc, false));
++            // 8 chained GDN blocks / FFN blocks (whole-graph composites with their small ops)
++            test_cases.emplace_back(new test_gdn_chain(GGML_TYPE_Q4_K, 5120, nc, 8));
++            test_cases.emplace_back(new test_ffn_chain(GGML_TYPE_Q4_K, 5120, 17408, nc, 8, 1));
++        }
++        return test_cases;
++    }
++
+     // LOCAL (longdraft): one verify step of the house model (Qwen3.8-27B qwen35 Q4_K_M, q8_0 LM head) at 8..16 tokens,
+     // every op shape it runs; env LONGDRAFT_ONLY=1 keeps just these (the rest of the perf list is skipped)
+     {

@@ -1,0 +1,1828 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Sun, 27 Sep 2026 12:35:41 -0600
+Subject: [PATCH 15/27] llama/server/sycl : cut host time in MTP verify steps
+
+Exact host-side changes for MTP speculative decoding, behind env
+switches (default off):
+- LLAMA_GRAPH_REUSE_MULTI: keep one allocated graph per small ubatch
+  size; restore a scheduler snapshot instead of rebuilding
+- LLAMA_SYNC_SKIP_IDLE: skip syncs on a context with no work in flight
+- LLAMA_KQ_MASK_FAST, LLAMA_KV_SEQ_RM_FAST: faster mask build, seq_rm
+- GGML_SYCL_GRAPH_SIG_MEMO: memoize SYCL graph signatures
+- GGML_SYCL_GRAPH_RECORD_AHEAD: record a new graph right after its
+  warmup submit while the GPU is busy
+Also fixes LLAMA_SAMPLER_FAST_TOPK never engaging (disabled samplers are
+named "?..."), with a heap select identical to std::partial_sort.
+
+Assisted-by: Claude Opus 5.5
+---
+ common/sampling.cpp               |  91 +++++--
+ common/speculative.cpp            |   4 +
+ ggml/include/ggml-alloc.h         |   2 +
+ ggml/include/ggml-backend.h       |   8 +
+ ggml/src/ggml-alloc.c             |   7 +
+ ggml/src/ggml-backend.cpp         | 139 ++++++++++
+ ggml/src/ggml-sycl/common.cpp     |   1 +
+ ggml/src/ggml-sycl/common.hpp     |  12 +
+ ggml/src/ggml-sycl/ggml-sycl.cpp  |  78 +++++-
+ ggml/src/ggml-sycl/mmq-dnn-u4.cpp |   1 +
+ src/llama-context.cpp             | 130 ++++++++-
+ src/llama-context.h               |  27 ++
+ src/llama-kv-cache.cpp            |  75 ++++++
+ src/llama-kv-cells.h              |  25 ++
+ tests/CMakeLists.txt              |   4 +
+ tests/test-hostv-reuse.cpp        | 422 ++++++++++++++++++++++++++++++
+ tests/test-hostv-sampling.cpp     | 235 +++++++++++++++++
+ tools/server/server-common.cpp    |  10 +
+ tools/server/server-common.h      |   1 +
+ tools/server/server-context.cpp   |  29 +-
+ 20 files changed, 1270 insertions(+), 31 deletions(-)
+ create mode 100644 tests/test-hostv-reuse.cpp
+ create mode 100644 tests/test-hostv-sampling.cpp
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index c378902eb2..ad41608531 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -162,6 +162,9 @@ struct common_sampler {
+             const int32_t k = fast_top_k();
+             if (k > 0 && k < n_vocab) {
+                 select_top_k(logits, n_vocab, k);
++                if (fast_top_k_mode() == 2) {
++                    check_top_k(logits, n_vocab, k);
++                }
+                 cur_p = { cur.data(), cur.size(), -1, true };
+                 return;
+             }
+@@ -178,8 +181,14 @@ struct common_sampler {
+     // env LLAMA_SAMPLER_FAST_TOPK=1: returns top_k when everything the chain runs before top-k is a no-op
+     // (no logit bias / suppress list, neutral penalties, DRY and top-n-sigma off) and no grammar or reasoning
+     // budget sees the full vocab; 0 otherwise
++    // [hostv] =2: also run the reference (full-vocab std::partial_sort) selection and abort on any difference
++    static int fast_top_k_mode() {
++        static const int mode = getenv("LLAMA_SAMPLER_FAST_TOPK") ? atoi(getenv("LLAMA_SAMPLER_FAST_TOPK")) : 0;
++        return mode;
++    }
++
+     int32_t fast_top_k() const {
+-        static const bool enabled = getenv("LLAMA_SAMPLER_FAST_TOPK") && atoi(getenv("LLAMA_SAMPLER_FAST_TOPK")) != 0;
++        const bool enabled = fast_top_k_mode() != 0;
+         if (!enabled || grmr || rbudget || params.mirostat != 0 || params.top_k <= 0) {
+             return 0;
+         }
+@@ -189,6 +198,12 @@ struct common_sampler {
+             if (name == "top-k") {
+                 return params.top_k;
+             }
++            // [hostv] disabled samplers are replaced by llama_sampler_init_empty("?<name>"), whose apply/accept do
++            // nothing: with the default --samplers order every sampler before top-k is one of those, and the old
++            // name checks below never matched them, so the fast path was never taken
++            if (!name.empty() && name[0] == '?') {
++                continue;
++            }
+             const bool noop =
+                 (name == "penalties"   && (params.penalty_last_n == 0 || (params.penalty_repeat == 1.0f &&
+                                            params.penalty_freq == 0.0f && params.penalty_present == 0.0f))) ||
+@@ -201,40 +216,80 @@ struct common_sampler {
+         return 0;
+     }
+ 
+-    // k largest logits, sorted by logit descending (ties: lower id first), into cur
++    // [hostv] the k best logits in exactly the order the chain's top-k sampler would leave them: that sampler runs
++    // std::partial_sort(first, first + k, last, logit >) over all n_vocab entries in id order, i.e. a heap select
++    // (make_heap of the first k, then for every later entry that is strictly better than the heap top a pop_heap
++    // that moves it in) followed by sort_heap. The same standard-library heap operations on the same entries in the
++    // same order reproduce its result bit for bit, ties included; entries that are not strictly better than the top
++    // are no-ops there, so whole 64-entry blocks without such an entry are skipped with a branch-free test.
+     void select_top_k(const float * logits, int n_vocab, int k) {
+-        auto better = [](const llama_token_data & a, const llama_token_data & b) {
+-            return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
++        auto comp = [](const llama_token_data & a, const llama_token_data & b) {
++            return a.logit > b.logit;
+         };
+-        cur.resize(k);
++        cur.resize(k + 1);
+         for (int i = 0; i < k; ++i) {
+             cur[i] = llama_token_data{i, logits[i], 0.0f};
+         }
+-        // min-heap on "better": cur[0] is the worst of the kept k
+-        std::make_heap(cur.begin(), cur.end(), better);
++        std::make_heap(cur.begin(), cur.begin() + k, comp);
+         float thr = cur[0].logit;
+-        // blocks of 64: a vectorisable max skips every block that cannot beat the current k-th best
+         constexpr int B = 64;
+         for (int i = k, end; i < n_vocab; i = end) {
+             end = std::min(n_vocab, (i / B + 1) * B);
+-            float m = logits[i];
+-            for (int j = i + 1; j < end; ++j) {
+-                m = std::max(m, logits[j]);
++            int any = 0;
++            for (int j = i; j < end; ++j) {
++                any |= logits[j] > thr;
+             }
+-            if (!(m > thr)) {
++            if (!any) {
+                 continue;
+             }
+             for (int j = i; j < end; ++j) {
+-                const float l = logits[j];
+-                if (l > thr) { // an equal logit has a higher id than every kept tie, so it never wins
+-                    std::pop_heap(cur.begin(), cur.end(), better);
+-                    cur.back() = llama_token_data{j, l, 0.0f};
+-                    std::push_heap(cur.begin(), cur.end(), better);
++                if (logits[j] > thr) {
++                    // == libstdc++ __heap_select: __pop_heap(first, middle, &entry_j)
++                    cur[k] = llama_token_data{j, logits[j], 0.0f};
++                    std::pop_heap(cur.begin(), cur.begin() + k + 1, comp);
+                     thr = cur[0].logit;
+                 }
+             }
+         }
+-        std::sort(cur.begin(), cur.end(), better);
++        cur.resize(k);
++        std::sort_heap(cur.begin(), cur.end(), comp);
++    }
++
++    // LLAMA_SAMPLER_FAST_TOPK=2: compare against the reference path on the real logits and on a copy rounded to a
++    // coarse grid (many exact ties), abort on any difference
++    void check_top_k(const float * logits, int n_vocab, int k) {
++        static int64_t n_checked = 0;
++        auto comp = [](const llama_token_data & a, const llama_token_data & b) {
++            return a.logit > b.logit;
++        };
++        std::vector<llama_token_data> fast = cur;
++        for (int pass = 0; pass < 2; ++pass) {
++            std::vector<float> rounded;
++            const float * lg = logits;
++            if (pass == 1) {
++                rounded.resize(n_vocab);
++                for (int i = 0; i < n_vocab; ++i) {
++                    rounded[i] = std::round(logits[i] * 4.0f) / 4.0f;
++                }
++                lg = rounded.data();
++                select_top_k(lg, n_vocab, k);
++            }
++            std::vector<llama_token_data> ref(n_vocab);
++            for (int i = 0; i < n_vocab; ++i) {
++                ref[i] = llama_token_data{i, lg[i], 0.0f};
++            }
++            std::partial_sort(ref.begin(), ref.begin() + k, ref.end(), comp);
++            for (int i = 0; i < k; ++i) {
++                if (ref[i].id != cur[i].id || memcmp(&ref[i].logit, &cur[i].logit, sizeof(float)) != 0) {
++                    GGML_ABORT("LLAMA_SAMPLER_FAST_TOPK=2: top-k mismatch at %d (pass %d): id %d vs %d", i, pass, cur[i].id, ref[i].id);
++                }
++            }
++        }
++        cur = fast;
++        if ((++n_checked & (n_checked - 1)) == 0) {
++            LOG_INF("%s: LLAMA_SAMPLER_FAST_TOPK=2: %lld top-k selections identical to the reference (incl. tie-heavy copies)\n",
++                    __func__, (long long) n_checked);
++        }
+     }
+ 
+     common_time_meas tm() {
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index f0835ffc5d..b97dc756af 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1681,6 +1681,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+ 
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
++        const int64_t hp_prep_t0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [hostv] mtp.catchup_prep
+         if (!is_mem_shared) {
+             common_batch_clear(batch);
+ 
+@@ -1737,6 +1738,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     llama_set_nextn_layer_offset(ctx_dft, head);
+                 }
+ 
++                if (hp_prep_t0 && head == 0 && batch.n_tokens <= 16) {
++                    llama_hprof_record("mtp.catchup_prep", hp_prep_t0);
++                }
+                 const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
+                 const int32_t rc = llama_decode(ctx_dft, batch);
+                 if (hp_t0) {
+diff --git a/ggml/include/ggml-alloc.h b/ggml/include/ggml-alloc.h
+index a7926a21a9..1211d308ef 100644
+--- a/ggml/include/ggml-alloc.h
++++ b/ggml/include/ggml-alloc.h
+@@ -71,6 +71,8 @@ GGML_API bool ggml_gallocr_reserve_n(
+ // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
+ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
+ 
++// [hostv] number of compute buffer (re)allocations so far: tensor addresses of an allocated graph stay valid while it is unchanged
++GGML_API uint64_t ggml_gallocr_get_n_realloc(ggml_gallocr_t galloc);
+ GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+ 
+ // Utils
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index cc3f8cd36e..d12b6a185e 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -336,6 +336,14 @@ extern "C" {
+     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
+     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
+ 
++    // [hostv] snapshots of an allocated graph: capture the scheduler state right after ggml_backend_sched_alloc_graph
++    // (NULL if unsupported, e.g. pipeline parallelism), restore it later to compute that same graph again without
++    // splitting/allocating it (returns false if the compute buffers were reallocated since, i.e. the snapshot is stale)
++    typedef struct ggml_backend_sched_snapshot * ggml_backend_sched_snapshot_t;
++    GGML_API ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_new(ggml_backend_sched_t sched);
++    GGML_API bool                          ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap);
++    GGML_API void                          ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap);
++
+     // Split graph without allocating it
+     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+ 
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index a71838eafc..04f7e26df9 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -493,6 +493,8 @@ struct ggml_gallocr {
+ 
+     struct leaf_alloc * leaf_allocs; // [n_leafs]
+     int n_leafs;
++
++    uint64_t n_realloc; // [hostv] bumped whenever a compute buffer is (re)allocated or dropped
+ };
+ 
+ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
+@@ -923,6 +925,7 @@ static bool ggml_gallocr_reserve_n_impl(
+             }
+         }
+         if (realloc) {
++            galloc->n_realloc++;
+ #ifndef NDEBUG
+             {
+                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+@@ -1097,6 +1100,10 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
+     return true;
+ }
+ 
++uint64_t ggml_gallocr_get_n_realloc(ggml_gallocr_t galloc) {
++    return galloc->n_realloc;
++}
++
+ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
+     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+ 
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index a04b2ebbef..408b60a20b 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -2261,6 +2261,145 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
+     return sched->backends[backend_index];
+ }
+ 
++// ---- [hostv] scheduler snapshots (llama LLAMA_GRAPH_REUSE_MULTI) ----
++// A snapshot captures everything ggml_backend_sched_compute_splits (and ggml_backend_sched_get_tensor_backend) read for
++// the graph of the last ggml_backend_sched_alloc_graph: the splits with their inputs, the used hash slots (tensor ->
++// backend id and split-input copies) and the bytes of the scheduler context that hold the split-input copy tensors
++// the graph nodes point to. Restoring it makes that graph computable again without splitting or allocating it, while
++// its tensors still own their offsets in the compute buffers. Graph tensors are not copied: their data pointers stay
++// valid as long as the gallocr did not reallocate a compute buffer, which the realloc counter checks. The caller must
++// not restore a snapshot whose graph was rebuilt, freed or re-allocated in the meantime.
++struct ggml_backend_sched_snapshot {
++    ggml_backend_sched_t sched = nullptr;
++    uint64_t             n_realloc = 0;
++
++    std::vector<char> ctx_bytes;
++
++    struct split_t {
++        int backend_id, i_start, i_end;
++        std::vector<ggml_tensor *> inputs;
++        ggml_cgraph graph;
++    };
++    std::vector<split_t> splits;
++    std::vector<ggml_tensor *> graph_inputs;
++
++    // used hash slots
++    std::vector<uint32_t>      slot_idx;
++    std::vector<ggml_tensor *> slot_key;
++    std::vector<int>           slot_backend;
++    std::vector<ggml_tensor *> slot_copies; // [n_slots][n_backends*n_copies]
++};
++
++ggml_backend_sched_snapshot_t ggml_backend_sched_snapshot_new(ggml_backend_sched_t sched) {
++    GGML_ASSERT(sched);
++    if (!sched->is_alloc || sched->n_copies != 1 || sched->ctx == NULL) {
++        return NULL;
++    }
++    auto * snap = new ggml_backend_sched_snapshot();
++    snap->sched     = sched;
++    snap->n_realloc = ggml_gallocr_get_n_realloc(sched->galloc);
++
++    const size_t used = ggml_used_mem(sched->ctx);
++    GGML_ASSERT(used <= sched->context_buffer_size);
++    snap->ctx_bytes.assign(sched->context_buffer, sched->context_buffer + used);
++
++    snap->splits.resize(sched->n_splits);
++    for (int i = 0; i < sched->n_splits; i++) {
++        const auto & s = sched->splits[i];
++        auto & d = snap->splits[i];
++        d.backend_id = s.backend_id;
++        d.i_start    = s.i_start;
++        d.i_end      = s.i_end;
++        d.inputs.assign(s.inputs, s.inputs + s.n_inputs);
++        d.graph      = s.graph;
++    }
++    snap->graph_inputs.assign(sched->graph_inputs, sched->graph_inputs + sched->n_graph_inputs);
++
++    const int nbc = sched->n_backends * sched->n_copies;
++    const size_t n_words = ggml_bitset_size(sched->hash_set.size);
++    for (size_t w = 0; w < n_words; w++) {
++        const ggml_bitset_t bits = sched->hash_set.used[w];
++        for (int b = 0; bits != 0 && b < (int) (sizeof(ggml_bitset_t)*8); b++) {
++            if (!((bits >> b) & 1u)) {
++                continue;
++            }
++            const size_t id = (w << BITSET_SHR) + b;
++            snap->slot_idx.push_back((uint32_t) id);
++            snap->slot_key.push_back(sched->hash_set.keys[id]);
++            snap->slot_backend.push_back(sched->hv_tensor_backend_ids[id]);
++            snap->slot_copies.insert(snap->slot_copies.end(), sched->hv_tensor_copies + id*nbc, sched->hv_tensor_copies + (id + 1)*nbc);
++        }
++    }
++    return snap;
++}
++
++bool ggml_backend_sched_snapshot_restore(ggml_backend_sched_t sched, ggml_backend_sched_snapshot_t snap) {
++    GGML_ASSERT(sched && snap && snap->sched == sched);
++    if (snap->n_realloc != ggml_gallocr_get_n_realloc(sched->galloc) || sched->n_copies != 1) {
++        return false;
++    }
++
++    // the split-input copy tensors at their original addresses in the scheduler context buffer
++    // (the context object itself keeps describing the last split; the next split frees and re-inits it)
++    memcpy(sched->context_buffer, snap->ctx_bytes.data(), snap->ctx_bytes.size());
++
++    // splits
++    const int n_splits = (int) snap->splits.size();
++    if (n_splits > sched->splits_capacity) {
++        auto * pnew = (ggml_backend_sched_split *) realloc(sched->splits, n_splits * sizeof(sched->splits[0]));
++        GGML_ASSERT(pnew != NULL);
++        memset(pnew + sched->splits_capacity, 0, (n_splits - sched->splits_capacity) * sizeof(sched->splits[0]));
++        sched->splits = pnew;
++        sched->splits_capacity = n_splits;
++    }
++    for (int i = 0; i < n_splits; i++) {
++        const auto & s = snap->splits[i];
++        auto & d = sched->splits[i];
++        while (d.inputs_capacity < (int) s.inputs.size()) {
++            ggml_backend_sched_split_inputs_grow(&d);
++        }
++        d.backend_id = s.backend_id;
++        d.i_start    = s.i_start;
++        d.i_end      = s.i_end;
++        d.n_inputs   = (int) s.inputs.size();
++        if (d.n_inputs > 0) {
++            memcpy(d.inputs, s.inputs.data(), d.n_inputs * sizeof(d.inputs[0]));
++        }
++        d.graph = s.graph;
++    }
++    sched->n_splits = n_splits;
++
++    while (sched->graph_inputs_capacity < (int) snap->graph_inputs.size()) {
++        ggml_backend_sched_graph_inputs_grow(sched);
++    }
++    sched->n_graph_inputs = (int) snap->graph_inputs.size();
++    if (sched->n_graph_inputs > 0) {
++        memcpy(sched->graph_inputs, snap->graph_inputs.data(), sched->n_graph_inputs * sizeof(sched->graph_inputs[0]));
++    }
++
++    // hash: only the snapshot's slots are marked used again; stale values in the other slots are never read for the
++    // tensors of this graph (linear probing only walks used slots), and the next ggml_backend_sched_reset clears all
++    ggml_hash_set_reset(&sched->hash_set);
++    const int nbc = sched->n_backends * sched->n_copies;
++    for (size_t k = 0; k < snap->slot_idx.size(); k++) {
++        const size_t id = snap->slot_idx[k];
++        ggml_bitset_set(sched->hash_set.used, id);
++        sched->hash_set.keys[id]          = snap->slot_key[k];
++        sched->hv_tensor_backend_ids[id]  = snap->slot_backend[k];
++        memcpy(sched->hv_tensor_copies + id*nbc, snap->slot_copies.data() + k*nbc, nbc * sizeof(ggml_tensor *));
++    }
++
++    sched->cur_copy  = 0;
++    sched->next_copy = 0;
++    sched->is_reset  = false;
++    sched->is_alloc  = true;
++    return true;
++}
++
++void ggml_backend_sched_snapshot_free(ggml_backend_sched_snapshot_t snap) {
++    delete snap;
++}
++
+ // utils
+ 
+ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
+diff --git a/ggml/src/ggml-sycl/common.cpp b/ggml/src/ggml-sycl/common.cpp
+index 9ee22dfff3..3a0165727f 100644
+--- a/ggml/src/ggml-sycl/common.cpp
++++ b/ggml/src/ggml-sycl/common.cpp
+@@ -134,6 +134,7 @@ void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type t
+ }
+ 
+ std::atomic<uint64_t> g_ggml_sycl_mem_epoch{0};
++std::atomic<uint64_t> g_ggml_sycl_opt_epoch{0};
+ bool g_ggml_sycl_graph_recording = false;
+ 
+ void ggml_sycl_free_device(void *ptr, sycl::queue &q) {
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index deab25bc4b..d8ca20a168 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -348,6 +348,7 @@ void ggml_sycl_free_device(void *ptr, sycl::queue &q);
+ // cache (GGML_SYCL_ENABLE_GRAPH=1) drops every recorded graph when it changes, so a replayed graph can
+ // never point at freed memory.
+ extern std::atomic<uint64_t> g_ggml_sycl_mem_epoch;
++extern std::atomic<uint64_t> g_ggml_sycl_opt_epoch; // [hostv] bumped when a weight gets reordered / repacked
+ 
+ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
+ 
+@@ -480,6 +481,17 @@ struct ggml_backend_sycl_context {
+     std::unordered_map<uint64_t, graph_cache_entry> graph_cache;
+     uint64_t graph_cache_epoch = 0;
+     uint64_t graph_cache_tick  = 0;
++
++    // [hostv] GGML_SYCL_GRAPH_SIG_MEMO: split graph uid -> signature
++    struct sig_memo_entry {
++        ggml_tensor ** nodes     = nullptr;
++        int            n_nodes   = 0;
++        uint64_t       opt_epoch = 0;
++        uint64_t       mem_epoch = 0;
++        uint64_t       h1 = 0, h2 = 0;
++        bool           valid = false;
++    };
++    std::unordered_map<uint64_t, sig_memo_entry> sig_memo;
+ #endif
+ 
+     ggml_sycl_pool & host_pool(int device) {
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 93705b6b9a..3c066459e1 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -4764,6 +4764,7 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
+ 
+     if (reorder_qw(src0, ctx->stream())) {
+         extra->optimized_feature.reorder = true;  // Used to decode/dequan in next steps and avoid re-reordering
++        g_ggml_sycl_opt_epoch.fetch_add(1, std::memory_order_relaxed); // [hostv] invalidates memoized graph signatures
+     }
+ }
+ 
+@@ -4781,6 +4782,7 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
+     }
+     if (reorder_qw(src0, ctx->stream())) {
+         extra->optimized_feature.reorder = true;
++        g_ggml_sycl_opt_epoch.fetch_add(1, std::memory_order_relaxed); // [hostv]
+     }
+ }
+ 
+@@ -6959,6 +6961,13 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
+ //                                 vision encoder) always run eagerly: they are GPU-bound, and it keeps
+ //                                 graph recording to the decode / draft / verify graphs the tests cover
+ //   GGML_SYCL_GRAPH_STATS=N       print counters every N graph_compute calls and at exit (0 = off)
++//   GGML_SYCL_GRAPH_RECORD_AHEAD=0 [hostv] 1: record + finalize a new signature right after its (last) warmup eager
++//                                 submission, while the GPU still runs it, instead of at its next call with the GPU
++//                                 idle (the next call replays; same commands, same pointers -> same results)
++//   GGML_SYCL_GRAPH_SIG_MEMO=0    [hostv] 1: reuse the signature of a split graph that the scheduler did not re-split
++//                                 or re-allocate (same graph uid, node array, node count, no weight reorder and no
++//                                 device free since) instead of hashing all nodes again; 2: also hash and abort on
++//                                 any difference (test mode)
+ //   GGML_SYCL_GRAPH_SELFTEST=1    test hook: eager run, poison node outputs with 0xFF, record, replay
+ //                                 (so test-backend-ops compares the REPLAYED result against the CPU);
+ //                                 =2 is the harness's negative control (records but never replays)
+@@ -6972,6 +6981,8 @@ struct ggml_sycl_graph_cfg {
+     int max_tokens = 32;
+     int stats     = 0;
+     int selftest  = 0;
++    int record_ahead = 0; // [hostv]
++    int sig_memo     = 0; // [hostv]
+ };
+ 
+ static const ggml_sycl_graph_cfg & ggml_sycl_graph_config() {
+@@ -6984,9 +6995,11 @@ static const ggml_sycl_graph_cfg & ggml_sycl_graph_config() {
+         c.max_tokens = std::max(1, ggml_sycl_get_env("GGML_SYCL_GRAPH_MAX_TOKENS", 32));
+         c.stats     = std::max(0, ggml_sycl_get_env("GGML_SYCL_GRAPH_STATS", 0));
+         c.selftest  = ggml_sycl_get_env("GGML_SYCL_GRAPH_SELFTEST", 0);
++        c.record_ahead = ggml_sycl_get_env("GGML_SYCL_GRAPH_RECORD_AHEAD", 0);
++        c.sig_memo     = ggml_sycl_get_env("GGML_SYCL_GRAPH_SIG_MEMO", 0);
+         if (g_ggml_sycl_enable_graph) {
+-            GGML_LOG_INFO("[SYCL-GRAPH] cache=%d warmup=%d max=%d min_nodes=%d max_tokens=%d stats=%d selftest=%d\n",
+-                          c.cache, c.warmup, c.max, c.min_nodes, c.max_tokens, c.stats, c.selftest);
++            GGML_LOG_INFO("[SYCL-GRAPH] cache=%d warmup=%d max=%d min_nodes=%d max_tokens=%d stats=%d selftest=%d record_ahead=%d sig_memo=%d\n",
++                          c.cache, c.warmup, c.max, c.min_nodes, c.max_tokens, c.stats, c.selftest, c.record_ahead, c.sig_memo);
+         }
+         return c;
+     }();
+@@ -7048,6 +7061,7 @@ static double   g_gstat_sig_us = 0;
+ // LOCAL: host time per path (stats on only): eager submit, record (queue capture), finalize, replay submit
+ static double   g_gstat_t_eager_us = 0, g_gstat_t_record_us = 0, g_gstat_t_finalize_us = 0, g_gstat_t_replay_us = 0;
+ static uint64_t g_gstat_n_finalize = 0, g_gstat_n_eager_timed = 0;
++static uint64_t g_gstat_record_ahead = 0, g_gstat_record_ahead_fail = 0, g_gstat_memo_hit = 0, g_gstat_memo_checked = 0; // [hostv]
+ 
+ // ---- [spechost] GGML_SYCL_GRAPH_MISSLOG=N: explain why a graph got a NEW cache signature (eager/record instead of
+ // replay). For every new signature it compares the graph node by node with the previous graph of the same shape class
+@@ -7183,6 +7197,11 @@ static void ggml_sycl_graph_stats_print() {
+                   (unsigned long long) g_gstat_eager, (unsigned long long) g_gstat_fail,
+                   (unsigned long long) g_gstat_flush, (unsigned long long) g_gstat_evict,
+                   (unsigned long long) g_gstat_selftest_skip, n ? g_gstat_sig_us / n : 0.0);
++    if (ggml_sycl_graph_config().record_ahead || ggml_sycl_graph_config().sig_memo) {
++        fprintf(stderr, "[SYCL-GRAPH] hostv: record_ahead=%llu record_ahead_fail=%llu sig_memo_hit=%llu sig_memo_checked=%llu\n",
++                (unsigned long long) g_gstat_record_ahead, (unsigned long long) g_gstat_record_ahead_fail,
++                (unsigned long long) g_gstat_memo_hit, (unsigned long long) g_gstat_memo_checked);
++    }
+     fprintf(stderr, "[SYCL-GRAPH] host ms/call: eager=%.3f record=%.3f finalize=%.3f replay=%.3f\n",
+                   g_gstat_n_eager_timed ? g_gstat_t_eager_us / g_gstat_n_eager_timed / 1e3 : 0.0,
+                   g_gstat_record ? g_gstat_t_record_us / g_gstat_record / 1e3 : 0.0,
+@@ -7355,12 +7374,41 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
+     }
+ 
+     uint64_t h1, h2;
+-    if (cfg.stats > 0) {
+-        const auto t0 = std::chrono::steady_clock::now();
+-        ggml_sycl_graph_signature(cgraph, h1, h2);
+-        g_gstat_sig_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+-    } else {
+-        ggml_sycl_graph_signature(cgraph, h1, h2);
++    {
++        const auto t0 = cfg.stats > 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++        // [hostv] GGML_SYCL_GRAPH_SIG_MEMO: a split graph that was not re-split / re-allocated keeps its uid, node
++        // array and tensor pointers; weight reorders and device frees bump the epochs that are part of the key
++        const uint64_t opt_epoch = g_ggml_sycl_opt_epoch.load(std::memory_order_relaxed);
++        ggml_backend_sycl_context::sig_memo_entry * me = nullptr;
++        bool have = false;
++        if (cfg.sig_memo > 0 && cgraph->uid != 0) {
++            if (ctx->sig_memo.size() > 4096) {
++                ctx->sig_memo.clear();
++            }
++            me = &ctx->sig_memo[cgraph->uid];
++            have = me->nodes == cgraph->nodes && me->n_nodes == cgraph->n_nodes && me->opt_epoch == opt_epoch &&
++                   me->mem_epoch == epoch && me->valid;
++        }
++        if (have && cfg.sig_memo == 1) {
++            h1 = me->h1;
++            h2 = me->h2;
++            g_gstat_memo_hit++;
++        } else {
++            ggml_sycl_graph_signature(cgraph, h1, h2);
++            if (have) {
++                g_gstat_memo_checked++;
++                if (me->h1 != h1 || me->h2 != h2) {
++                    GGML_ABORT("[SYCL-GRAPH] GGML_SYCL_GRAPH_SIG_MEMO=2: memoized signature differs (uid %llu, %d nodes)",
++                               (unsigned long long) cgraph->uid, cgraph->n_nodes);
++                }
++            }
++            if (me) {
++                *me = { cgraph->nodes, cgraph->n_nodes, opt_epoch, epoch, h1, h2, true };
++            }
++        }
++        if (cfg.stats > 0) {
++            g_gstat_sig_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
++        }
+     }
+ 
+     auto it = ctx->graph_cache.find(h1);
+@@ -7403,6 +7451,20 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
+             }
+             // fall through: record + replay the same graph now
+         } else {
++            // [hostv] GGML_SYCL_GRAPH_RECORD_AHEAD: record + finalize now, while the GPU runs the eager submission,
++            // instead of at the next call; that call then replays
++            if (cfg.record_ahead > 0 && !e.no_graph && e.seen >= cfg.warmup) {
++                auto exec = ggml_sycl_graph_record(ctx, cgraph);
++                if (exec) {
++                    g_gstat_record++;
++                    g_gstat_record_ahead++;
++                    e.exec = std::move(exec);
++                } else {
++                    // e.g. an op depends on an event of the still running eager submission (oneDNN): not a
++                    // failure of the graph, the next call records it the regular way
++                    g_gstat_record_ahead_fail++;
++                }
++            }
+             ggml_sycl_graph_cache_evict(ctx, (size_t) cfg.max);
+             return;
+         }
+diff --git a/ggml/src/ggml-sycl/mmq-dnn-u4.cpp b/ggml/src/ggml-sycl/mmq-dnn-u4.cpp
+index eb57bd82be..4cf5e75b6a 100644
+--- a/ggml/src/ggml-sycl/mmq-dnn-u4.cpp
++++ b/ggml/src/ggml-sycl/mmq-dnn-u4.cpp
+@@ -189,6 +189,7 @@ bool ggml_sycl_dnn_u4_prepare(ggml_backend_sycl_context & ctx, const ggml_tensor
+     extra->dnn_mins                 = mn_dev;
+     extra->dnn_scales_device        = ctx.device;
+     extra->optimized_feature.dnn_u4 = true;
++    g_ggml_sycl_opt_epoch.fetch_add(1, std::memory_order_relaxed); // [hostv]
+     return true;
+ }
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f056167d24..d43f4b547a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -284,6 +284,16 @@ llama_context::llama_context(
+         if (graph_reuse_disable) {
+             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+         }
++
++        // [hostv] multi-graph reuse
++        const char * e_multi = getenv("LLAMA_GRAPH_REUSE_MULTI");
++        if (e_multi && atoi(e_multi) != 0 && !graph_reuse_disable) {
++            const char * e_max = getenv("LLAMA_GRAPH_REUSE_MULTI_MAX");
++            const char * e_tok = getenv("LLAMA_GRAPH_REUSE_MULTI_TOKENS");
++            gcache_max        = e_max ? std::max(1, atoi(e_max)) : 16;
++            gcache_max_tokens = e_tok ? (uint32_t) std::max(1, atoi(e_tok)) : 16u;
++            LLAMA_LOG_INFO("%s: multi-graph reuse: up to %d graphs of <= %u tokens\n", __func__, gcache_max, gcache_max_tokens);
++        }
+     }
+ 
+     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+@@ -638,6 +648,7 @@ void llama_context::sched_reserve() {
+     for (auto & res : gf_res_prev) {
+         res.reset();
+     }
++    gcache_clear();
+     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+     gf_res_prev_active = nullptr;
+ 
+@@ -791,11 +802,29 @@ static void llama_hprof_add(const std::string & key, int64_t t0_us) {
+     a.ms += (ggml_time_us() - t0_us) / 1000.0;
+ }
+ 
++// [hostv] env LLAMA_SYNC_SKIP_IDLE=1 (default 0): llama_synchronize() on a context that has submitted no graph since its
++// last synchronize returns without waiting on its backends. All SYCL contexts of a device share one in-order queue,
++// so that wait also blocked on OTHER contexts' work: e.g. reading the target outputs (MTP process_h_rows,
++// common_sampler_sample on ctx_tgt) right after launching the MTP catch-up on ctx_dft waited for the whole catch-up
++// graph. The data read is the same: every output of this context was completed by its last real synchronize.
++static bool llama_sync_skip_idle() {
++    static const bool on = [] {
++        const char * e = getenv("LLAMA_SYNC_SKIP_IDLE");
++        return e && atoi(e) != 0;
++    }();
++    return on;
++}
++
+ void llama_context::synchronize() {
+     if (!sched) {
+         return;
+     }
+ 
++    if (llama_sync_skip_idle() && !sched_pending && n_queued_tokens == 0) {
++        return;
++    }
++    sched_pending = false;
++
+     {
+         const int64_t t0 = llama_hprof_mode() > 0 ? ggml_time_us() : 0;
+         ggml_backend_sched_synchronize(sched.get());
+@@ -907,6 +936,7 @@ bool llama_context::memory_update(bool optimize) {
+                 res->reset();
+             }
+         }
++        gcache_clear();
+         gf_res_prev_active = nullptr;
+ 
+         if (!mctx->apply()) {
+@@ -1433,14 +1463,62 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     int64_t hp_t0 = hprof ? ggml_time_us() : 0;
+     bool hp_reused = false;
+ 
+-    auto * res = get_gf_res_prev();
++    // [hostv] LLAMA_GRAPH_REUSE_MULTI: small ubatches use the multi-graph cache instead of gf_res_prev
++    const bool use_gcache = gcache_max > 0 && ubatch.n_tokens <= gcache_max_tokens && !cparams.pipeline_parallel;
++    graph_cache_entry * gce = nullptr;
++    bool gce_hit     = false;
++    bool hp_restored = false;
++
++    llm_graph_result * res = nullptr;
++    if (use_gcache) {
++        gcache_tick++;
++        // pass 0: the entry already loaded in the scheduler (plain reuse), pass 1: any other built entry (restore)
++        for (int pass = 0; pass < 2 && !gce; ++pass) {
++            for (auto & e : gcache) {
++                auto * r = e->res.get();
++                if ((pass == 0) != (gf_res_prev_active == r) || r->get_gf() == nullptr || ggml_graph_n_nodes(r->get_gf()) == 0) {
++                    continue;
++                }
++                if (!r->can_reuse(graph_params(r, ubatch, mctx, gtype))) {
++                    continue;
++                }
++                gce = e.get();
++                if (gf_res_prev_active == r) {
++                    gce_hit = true;
++                } else if (e->snap && ggml_backend_sched_snapshot_restore(sched.get(), e->snap)) {
++                    gf_res_prev_active = r;
++                    gce_hit     = true;
++                    hp_restored = true;
++                }
++                // else: no snapshot or stale (compute buffers reallocated) -> rebuild this entry in place
++                break;
++            }
++        }
++        if (!gce) {
++            if ((int) gcache.size() < gcache_max) {
++                gcache.emplace_back(new graph_cache_entry());
++                gcache.back()->res.reset(new llm_graph_result(graph_max_nodes(ubatch.n_tokens)));
++                gce = gcache.back().get();
++            } else {
++                for (auto & e : gcache) { // least recently used
++                    if (!gce || e->last_use < gce->last_use) {
++                        gce = e.get();
++                    }
++                }
++            }
++        }
++        gce->last_use = gcache_tick;
++        res = gce->res.get();
++    } else {
++        res = get_gf_res_prev();
++    }
+     auto * gf  = res->get_gf();
+ 
+     // the new graph parameters
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
++    if (use_gcache ? gce_hit : (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams))) {
+         hp_reused = true;
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+@@ -1454,6 +1532,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         n_reused++;
+     } else {
+         gf_res_prev_active = nullptr;
++        if (gce) {
++            // [hostv] the snapshot describes the graph that is about to be replaced: drop it first, so that a failed
++            // build/alloc below cannot leave a snapshot of freed tensors behind
++            ggml_backend_sched_snapshot_free(gce->snap);
++            gce->snap = nullptr;
++        }
+         res->reset();
+ 
+         ggml_backend_sched_reset(sched.get());
+@@ -1478,6 +1562,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+ 
+         gf_res_prev_active = res;
++
++        if (gce) {
++            gce->snap = graph_cacheable(gf) ? ggml_backend_sched_snapshot_new(sched.get()) : nullptr;
++        }
+     }
+ 
+     // set the input data for the input tensors
+@@ -1486,7 +1574,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         if (hprof) {
+-            llama_hprof_add(hp_tag + (hp_reused ? ".build_reuse" : ".build_alloc"), hp_t0);
++            llama_hprof_add(hp_tag + (hp_restored ? ".build_restore" : hp_reused ? ".build_reuse" : ".build_alloc"), hp_t0);
+             hp_t0 = ggml_time_us();
+         }
+ 
+@@ -2478,6 +2566,38 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+     return res;
+ }
+ 
++void llama_context::gcache_clear() {
++    for (auto & e : gcache) {
++        if (gf_res_prev_active == e->res.get()) {
++            gf_res_prev_active = nullptr;
++        }
++    }
++    gcache.clear();
++}
++
++// [hostv] a graph can stay allocated next to others only if none of its compute tensors carries backend state that
++// the allocation of another graph resets (e.g. the SYCL buffer reset frees the extras of quantized tensors)
++bool llama_context::graph_cacheable(const ggml_cgraph * gf) {
++    auto bad = [](const ggml_tensor * t) {
++        return t && t->buffer && t->view_src == nullptr &&
++               ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
++               (ggml_is_quantized(t->type) || t->extra != nullptr);
++    };
++    ggml_cgraph * g = const_cast<ggml_cgraph *>(gf);
++    for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
++        const ggml_tensor * t = ggml_graph_node(g, i);
++        if (bad(t)) {
++            return false;
++        }
++        for (int j = 0; j < GGML_MAX_SRC; j++) {
++            if (bad(t->src[j])) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ llm_graph_result * llama_context::get_gf_res_reserve() const {
+     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+ }
+@@ -2565,6 +2685,7 @@ ggml_cgraph * llama_context::graph_reserve(
+             res->reset();
+         }
+     }
++    gcache_clear();
+     gf_res_prev_active = nullptr;
+ 
+     // store the n_outputs as it is, and restore it afterwards
+@@ -2648,6 +2769,7 @@ ggml_status llama_context::graph_compute(
+         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+     }
+ 
++    sched_pending = true; // [hostv] LLAMA_SYNC_SKIP_IDLE
+     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+@@ -3661,6 +3783,7 @@ void llama_context::opt_epoch_iter(
+             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
+ 
+             // the optimizer graph is allocated outside sched, so the next decode must rebuild
++            gcache_clear();
+             gf_res_prev_active = nullptr;
+             res->reset();
+ 
+@@ -3692,6 +3815,7 @@ void llama_context::opt_epoch_iter(
+                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                 }
+             }
++            sched_pending = true; // [hostv] LLAMA_SYNC_SKIP_IDLE
+             ggml_opt_eval(opt_ctx, result);
+             if (callback) {
+                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 77ef92fc6a..a1ee1d6bb5 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -374,6 +374,33 @@ private:
+ 
+     llm_graph_result * gf_res_prev_active = nullptr;
+ 
++    // [hostv] env LLAMA_GRAPH_REUSE_MULTI=1 (default 0): besides the two gf_res_prev graphs, keep up to
++    // LLAMA_GRAPH_REUSE_MULTI_MAX (default 16) built + allocated graphs for ubatches of at most
++    // LLAMA_GRAPH_REUSE_MULTI_TOKENS (default 16) tokens, e.g. one per speculative verify / catch-up size, each with a
++    // snapshot of the scheduler state. A later ubatch whose graph would be identical (llm_graph_result::can_reuse, the
++    // same test as the single-graph reuse) restores that snapshot instead of rebuilding, splitting and allocating the
++    // graph. The least recently used entry is rebuilt in place when the cache is full.
++    struct graph_cache_entry {
++        llm_graph_result_ptr          res;
++        ggml_backend_sched_snapshot_t snap     = nullptr;
++        uint64_t                      last_use = 0;
++
++        graph_cache_entry() = default;
++        graph_cache_entry(const graph_cache_entry &) = delete;
++        graph_cache_entry & operator=(const graph_cache_entry &) = delete;
++        ~graph_cache_entry() { ggml_backend_sched_snapshot_free(snap); }
++    };
++    std::vector<std::unique_ptr<graph_cache_entry>> gcache;
++    int      gcache_max        = 0; // 0 = off
++    uint32_t gcache_max_tokens = 16;
++    uint64_t gcache_tick       = 0;
++
++    void gcache_clear();
++
++    // [hostv] LLAMA_SYNC_SKIP_IDLE: true while this context may have submitted work that synchronize() did not wait for
++    bool sched_pending = true;
++    static bool graph_cacheable(const ggml_cgraph * gf);
++
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index c5aac03c90..a34e21bf86 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -402,6 +402,22 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+ 
+         uint32_t new_head = cells.size();
+ 
++        // [hostv] env LLAMA_KV_SEQ_RM_FAST=1 (default 0): visit only the cells of seq_id with a position in [p0, p1)
++        // (from the per-sequence position set) instead of scanning every cell of the cache; the same cells are
++        // removed and the new head is the lowest freed cell, as in the scan
++        static const bool fast = [] {
++            const char * e = getenv("LLAMA_KV_SEQ_RM_FAST");
++            return e && atoi(e) != 0;
++        }();
++        if (fast) {
++            std::vector<uint32_t> idxs;
++            cells.seq_cells_range(seq_id, p0, p1, idxs);
++            for (const uint32_t i : idxs) {
++                if (cells.seq_rm(i, seq_id)) {
++                    new_head = std::min(new_head, i);
++                }
++            }
++        } else
+         for (uint32_t i = 0; i < cells.size(); ++i) {
+             if (!cells.pos_in(i, p0, p1)) {
+                 continue;
+@@ -1562,8 +1578,24 @@ struct args_set_input_kq_mask {
+     int64_t n_kv;
+     int64_t n_stream;
+     int64_t n_tps;
++
++    bool fast; // [hostv] LLAMA_KQ_MASK_FAST
+ };
+ 
++// [hostv] env LLAMA_KQ_MASK_FAST=1 (default 0): build the first KQ-mask row of each sequence with one branch-free pass
++// over the cell positions when every used cell of the stream carries that sequence (the usual single-sequence
++// case), instead of testing the per-cell sequence bitsets (32 bytes per cell) cell by cell. Same mask bit for bit:
++// seq_has(j) == !is_empty(j) under that condition, M-RoPE 2D checks are applied to the few cells at position p1 and
++// the "cells near the batch" list comes from the per-sequence position set. LLAMA_KQ_MASK_FAST=2 also builds every
++// mask the reference way and aborts on any difference (test mode).
++static int llama_kq_mask_fast_mode() {
++    static const int mode = [] {
++        const char * e = getenv("LLAMA_KQ_MASK_FAST");
++        return e ? atoi(e) : 0;
++    }();
++    return mode;
++}
++
+ template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
+ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
+   //const auto & hparams = args.hparams;
+@@ -1640,6 +1672,28 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
+                 }
+             }
+ 
++            // [hostv] LLAMA_KQ_MASK_FAST: first row of this sequence in one branch-free pass
++            if (causal && !swa && !alibi && !prev && args.fast && cells.get_used() == cells.seq_n_cells(seq_id)) {
++                const llama_pos * P = cells.pos_data();
++                const uint32_t up1 = (uint32_t) p1; // empty cells have pos -1 -> 0xffffffff > p1
++                T * row = data + idst;
++                for (int64_t j = 0; j < n_kv; ++j) {
++                    row[j] = (uint32_t) P[j] <= up1 ? mask_keep : mask_drop;
++                }
++                const llama_pos p_near = seq_pos_min[seq_id] - (llama_pos) (n_swa + 32);
++                cells.seq_cells_from(seq_id, p_near, [&](llama_pos pc, uint32_t j) {
++                    if ((int64_t) j >= n_kv) {
++                        return;
++                    }
++                    idxs.push_back(j);
++                    if (is_2d && pc == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
++                        row[j] = mask_drop;
++                    }
++                });
++                GGML_UNUSED(p0);
++                continue;
++            }
++
+             for (uint32_t jj = 0; jj < n_kv; ++jj) {
+                 uint32_t j = jj;
+ 
+@@ -1786,6 +1840,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+         /*.n_kv             =*/ n_kv,
+         /*.n_stream         =*/ n_stream,
+         /*.n_tps            =*/ n_tps,
++        /*.fast             =*/ llama_kq_mask_fast_mode() > 0,
+     };
+ 
+     if (dst->type == GGML_TYPE_F16) {
+@@ -1794,6 +1849,26 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+     }
+ 
++    if (llama_kq_mask_fast_mode() == 2) {
++        // test mode: rebuild with the reference path and compare bit for bit
++        std::vector<uint8_t> ref(ggml_nbytes(dst));
++        args_set_input_kq_mask args_ref = args;
++        args_ref.fast = false;
++        if (dst->type == GGML_TYPE_F16) {
++            set_input_kq_mask_impl<ggml_fp16_t>(args_ref, (ggml_fp16_t *) ref.data(), causal_attn);
++        } else {
++            set_input_kq_mask_impl<float>(args_ref, (float *) ref.data(), causal_attn);
++        }
++        static int64_t n_checked = 0;
++        n_checked++;
++        if (memcmp(ref.data(), dst->data, ref.size()) != 0) {
++            GGML_ABORT("LLAMA_KQ_MASK_FAST mismatch (n_kv = %lld, n_tokens = %u, check #%lld)", (long long) n_kv, n_tokens, (long long) n_checked);
++        }
++        if ((n_checked & (n_checked - 1)) == 0) {
++            LLAMA_LOG_INFO("%s: LLAMA_KQ_MASK_FAST=2: %lld masks identical so far (n_kv = %lld)\n", __func__, (long long) n_checked, (long long) n_kv);
++        }
++    }
++
+     //const int64_t t_end = ggml_time_us();
+ 
+     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index 5d567a6ed0..e6fb935c52 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -86,6 +86,31 @@ public:
+         return used.size();
+     }
+ 
++    // [hostv] fast KQ-mask support
++    const llama_pos * pos_data() const {
++        return pos.data();
++    }
++
++    // number of cells that carry sequence seq_id (== get_used() iff every used cell carries it)
++    size_t seq_n_cells(llama_seq_id seq_id) const {
++        return seq_pos[seq_id].size();
++    }
++
++    // call f(pos, cell) for every cell of seq_id with position >= p_min, in (pos, cell) order
++    template <typename F>
++    void seq_cells_from(llama_seq_id seq_id, llama_pos p_min, F && f) const {
++        for (auto it = seq_pos[seq_id].lower_bound({ p_min, 0u }); it != seq_pos[seq_id].end(); ++it) {
++            f(it->first, it->second);
++        }
++    }
++
++    // append the cells of seq_id with position in [p0, p1) to out
++    void seq_cells_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> & out) const {
++        for (auto it = seq_pos[seq_id].lower_bound({ p0, 0u }); it != seq_pos[seq_id].end() && it->first < p1; ++it) {
++            out.push_back(it->second);
++        }
++    }
++
+     // the index of the first cell that is used
+     // return 0 if no cells are used
+     uint32_t used_min() const {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 00fac7685c..f43472896d 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -382,3 +382,7 @@ endif()
+ 
+ # LOCAL (spechost): graph-input upload host cost / correctness probe (GGML_SYCL_ASYNC_INPUTS)
+ llama_build(test-spechost-inputs.cpp)
++
++# LOCAL (hostv): LLAMA_GRAPH_REUSE_MULTI end-to-end exactness / host-time probe on a random tiny QWEN35 (+MTP)
++llama_build(test-hostv-reuse.cpp)
++llama_build(test-hostv-sampling.cpp)
+diff --git a/tests/test-hostv-reuse.cpp b/tests/test-hostv-reuse.cpp
+new file mode 100644
+index 0000000000..ea954b3472
+--- /dev/null
++++ b/tests/test-hostv-reuse.cpp
+@@ -0,0 +1,422 @@
++// LOCAL (hostv): model-free end-to-end exactness + host-time probe for the host-side speculative-decoding changes
++// (LLAMA_GRAPH_REUSE_MULTI, LLAMA_KQ_MASK_FAST, LLAMA_SYNC_SKIP_IDLE, GGML_SYCL_GRAPH_RECORD_AHEAD / _SIG_MEMO).
++//
++// Builds a small random QWEN35 model in memory with the production layer layout (64 layers, full attention every
++// 4th, + 1 MTP nextn block), so the target graph has the production node count and host build/split/alloc cost,
++// but tiny tensors. Two independent context pairs (target + MTP draft) run the SAME server-like call sequence:
++//   drafts: 0..7 single-token MTP decodes (token + hidden row), each read back (logits + nextn row)
++//   verify: 1..8 tokens, all logits, llama_synchronize(tgt)
++//   catch-up: MTP decode of the verify batch, NOT synchronized (the server reads the target outputs meanwhile)
++//   read:   all target logits + nextn rows (after the catch-up was launched, as the server does)
++//   accept: random prefix, rollback of the rest (n_rs_seq = 8 target snapshots, KV seq_rm on both)
++// pair A has LLAMA_GRAPH_REUSE_MULTI=0, pair B LLAMA_GRAPH_REUSE_MULTI=<multi_b>; every row of A and B is compared
++// bit for bit, and a checksum over all of pair A's outputs is printed so that runs with different global switches
++// (the other envs) can be compared against each other.
++//
++// usage: test-hostv-reuse [steps=400] [multi_b=1] [n_layer=64] [n_ctx=4096] [seed=1] [n_vocab=4096] [mtp=1] [n_prompt=300]
++#include "common.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++#include "ggml.h"
++#include "gguf.h"
++#include "llama.h"
++#include "llama-cpp.h"
++
++#include "../src/llama-arch.h"
++#include "../src/llama-ext.h"
++#include "../src/llama-model-saver.h"
++
++#include <cinttypes>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <random>
++#include <string>
++#include <vector>
++
++#ifdef _WIN32
++static void set_env(const char * k, const char * v) { _putenv_s(k, v); }
++#else
++static void set_env(const char * k, const char * v) { setenv(k, v, 1); }
++#endif
++
++static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
++    const size_t seed0 = *(const size_t *) userdata;
++    std::hash<std::string> hasher;
++    std::mt19937 gen(seed0 ^ hasher(tensor->name));
++    std::normal_distribution<float> dis(0.0f, 0.1f);
++    const bool is_ssm_a = strstr(tensor->name, "ssm_a") != nullptr;
++    const int64_t ne = ggml_nelements(tensor);
++    if (tensor->type == GGML_TYPE_F32) {
++        std::vector<float> tmp(ne);
++        for (auto & v : tmp) { const float x = dis(gen); v = is_ssm_a ? -fabsf(x) : x; }
++        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
++    } else if (tensor->type == GGML_TYPE_F16) {
++        std::vector<ggml_fp16_t> tmp(ne);
++        for (auto & v : tmp) { const float x = dis(gen); v = ggml_fp32_to_fp16(is_ssm_a ? -fabsf(x) : x); }
++        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
++    } else {
++        GGML_ABORT("unexpected tensor type %s for %s", ggml_type_name(tensor->type), tensor->name);
++    }
++}
++
++static gguf_context_ptr make_qwen35(uint32_t n_layer, uint32_t n_vocab, bool mtp) {
++    gguf_context_ptr ret(gguf_init_empty());
++    llama_model_saver ms(LLM_ARCH_QWEN35, ret.get());
++    const uint32_t n_embd = 256, n_head = 2, n_ff = 384, n_embd_head = n_embd / n_head;
++
++    ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,        llm_arch_name(LLM_ARCH_QWEN35));
++    ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab);
++    ms.add_kv(LLM_KV_CONTEXT_LENGTH,              uint32_t(262144));
++    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,            n_embd);
++    ms.add_kv(LLM_KV_BLOCK_COUNT,                 n_layer + (mtp ? 1u : 0u));
++    if (mtp) {
++        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS,    uint32_t(1));
++    }
++    ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,         n_ff);
++    ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,     uint32_t(4));
++    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,        n_head);
++    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,     uint32_t(1));
++    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
++    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,     std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
++    ms.add_kv(LLM_KV_SSM_INNER_SIZE,              uint32_t(256));
++    ms.add_kv(LLM_KV_SSM_CONV_KERNEL,             uint32_t(4));
++    ms.add_kv(LLM_KV_SSM_STATE_SIZE,              uint32_t(128));
++    ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,          n_head);
++    ms.add_kv(LLM_KV_SSM_GROUP_COUNT,             uint32_t(2));
++    {
++        std::vector<std::string> list(n_vocab);
++        std::vector<float>       scores(n_vocab, 0.0f);
++        ms.add_kv(LLM_KV_TOKENIZER_MODEL, "test");
++        for (uint32_t i = 0; i < n_vocab; i++) {
++            list[i] = "tok_" + std::to_string(i);
++        }
++        ms.add_kv(LLM_KV_TOKENIZER_LIST,   list);
++        ms.add_kv(LLM_KV_TOKENIZER_SCORES, scores);
++    }
++    return ret;
++}
++
++struct timing {
++    std::map<std::string, std::pair<int64_t, double>> acc; // key -> (n, ms)
++    void add(const std::string & k, int64_t t0) {
++        auto & a = acc[k];
++        a.first++;
++        a.second += (ggml_time_us() - t0) / 1000.0;
++    }
++};
++
++struct pair_ctx {
++    llama_context_ptr  tgt;
++    llama_context_ptr  dft;
++    timing             tm;
++    std::vector<float> pending_h;
++    // outputs of the current step, compared between the pairs
++    std::vector<float> out;
++};
++
++static int      n_mismatch = 0;
++static int      n_compared = 0;
++static uint64_t checksum   = 1469598103934665603ull;
++
++static void hash_bytes(const void * p, size_t n) {
++    const uint8_t * b = (const uint8_t *) p;
++    for (size_t i = 0; i < n; i++) {
++        checksum = (checksum ^ b[i]) * 1099511628211ull;
++    }
++}
++
++int main(int argc, char ** argv) {
++    const int      steps    = argc > 1 ? atoi(argv[1]) : 400;
++    const int      multi_b  = argc > 2 ? atoi(argv[2]) : 1;
++    const uint32_t n_layer  = argc > 3 ? atoi(argv[3]) : 64;
++    const uint32_t n_ctx    = argc > 4 ? atoi(argv[4]) : 4096;
++    const size_t   seed     = argc > 5 ? atoll(argv[5]) : 1;
++    const uint32_t n_vocab  = argc > 6 ? atoi(argv[6]) : 4096;
++    const bool     mtp      = argc > 7 ? atoi(argv[7]) != 0 : true;
++    const int      n_prompt = argc > 8 ? atoi(argv[8]) : 300;
++
++    llama_backend_init();
++
++    ggml_backend_dev_t dev = nullptr;
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            dev = ggml_backend_dev_get(i);
++            break;
++        }
++    }
++    if (!dev) {
++        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++    }
++    fprintf(stderr, "device: %s  steps=%d multi_b=%d n_layer=%u n_ctx=%u seed=%zu n_vocab=%u mtp=%d n_prompt=%d\n",
++            ggml_backend_dev_description(dev), steps, multi_b, n_layer, n_ctx, seed, n_vocab, (int) mtp, n_prompt);
++
++    auto gguf = make_qwen35(n_layer, n_vocab, mtp);
++    llama_model_params mp = llama_model_default_params();
++    std::vector<ggml_backend_dev_t> devs = { dev, nullptr };
++    mp.devices = devs.data();
++    mp.load_mtp = mtp;
++    size_t wseed = seed;
++    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &wseed, mp));
++    if (!model) {
++        fprintf(stderr, "failed to create model\n");
++        return 1;
++    }
++    const int n_embd      = llama_model_n_embd(model.get());
++    const int n_vocab_out = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
++
++    auto make_pair = [&](int multi) {
++        pair_ctx p;
++        set_env("LLAMA_GRAPH_REUSE_MULTI", multi ? "1" : "0");
++        llama_context_params cp = llama_context_default_params();
++        cp.n_ctx      = n_ctx;
++        cp.n_batch    = 512;
++        cp.n_ubatch   = 512;
++        cp.n_seq_max  = 1;
++        cp.kv_unified = true;
++        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++        cp.n_rs_seq   = 8;
++        cp.n_threads  = cp.n_threads_batch = 4;
++        p.tgt.reset(llama_init_from_model(model.get(), cp));
++        GGML_ASSERT(p.tgt);
++        if (mtp) {
++            cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++            cp.n_rs_seq = 0;
++            p.dft.reset(llama_init_from_model(model.get(), cp));
++            GGML_ASSERT(p.dft);
++            llama_set_embeddings_nextn(p.tgt.get(), true, false);
++            llama_set_embeddings_nextn(p.dft.get(), true, true);
++        }
++        p.pending_h.assign(n_embd, 0.0f);
++        return p;
++    };
++    pair_ctx A = make_pair(0);
++    pair_ctx B = make_pair(multi_b);
++    pair_ctx * pairs[2] = { &A, &B };
++
++    std::mt19937 rng(seed * 7919 + 1);
++    auto rnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); };
++
++    llama_batch batch  = llama_batch_init(512, 0, 1);
++    llama_batch batchd = llama_batch_init(512, n_embd, 1); // token + embd (MTP)
++    std::vector<llama_token> tok_store(512);
++    batchd.token = tok_store.data(); // llama_batch_init allocates either token or embd; MTP batches carry both
++
++    auto push = [&](pair_ctx & p, const float * v, size_t n) {
++        p.out.insert(p.out.end(), v, v + n);
++    };
++    auto compare_step = [&](int step, const char * what) {
++        n_compared++;
++        hash_bytes(A.out.data(), A.out.size() * sizeof(float));
++        if (A.out.size() != B.out.size() || memcmp(A.out.data(), B.out.data(), A.out.size() * sizeof(float)) != 0) {
++            if (n_mismatch < 20) {
++                size_t i = 0;
++                while (i < A.out.size() && i < B.out.size() && memcmp(&A.out[i], &B.out[i], sizeof(float)) == 0) {
++                    i++;
++                }
++                fprintf(stderr, "MISMATCH step %d %s at %zu/%zu\n", step, what, i, A.out.size());
++            }
++            n_mismatch++;
++        }
++        A.out.clear();
++        B.out.clear();
++    };
++
++    // --- prompt
++    std::vector<llama_token> hist;
++    for (int i = 0; i < n_prompt; i++) {
++        hist.push_back(rnd(0, n_vocab - 1));
++    }
++    for (pair_ctx * p : pairs) {
++        for (int i0 = 0; i0 < n_prompt; i0 += 512) {
++            const int n = std::min(512, n_prompt - i0);
++            common_batch_clear(batch);
++            for (int i = i0; i < i0 + n; i++) {
++                common_batch_add(batch, hist[i], i, { 0 }, i == n_prompt - 1);
++            }
++            GGML_ASSERT(llama_decode(p->tgt.get(), batch) == 0);
++            if (mtp) {
++                // shapes matter here, not semantics: zero hidden rows
++                batchd.n_tokens = n;
++                for (int k = 0; k < n; k++) {
++                    batchd.token[k] = hist[i0 + k]; batchd.pos[k] = i0 + k; batchd.n_seq_id[k] = 1; batchd.seq_id[k][0] = 0; batchd.logits[k] = 0;
++                    memset(batchd.embd + (size_t) k * n_embd, 0, n_embd * sizeof(float));
++                }
++                GGML_ASSERT(llama_decode(p->dft.get(), batchd) == 0);
++            }
++        }
++        llama_synchronize(p->tgt.get());
++        if (mtp) {
++            llama_synchronize(p->dft.get());
++        }
++    }
++    llama_pos pos = n_prompt;
++    fprintf(stderr, "prompt done (%d tokens)\n", n_prompt);
++
++    llama_token last = hist.back();
++    int n_verify_tokens = 0;
++    for (int step = 0; step < steps && pos + 16 < (llama_pos) n_ctx; step++) {
++        // the random choices of this step are shared by both pairs
++        const int n_draft = rnd(0, 7);
++        std::vector<llama_token> draft;
++        for (int d = 0; d < n_draft; d++) {
++            draft.push_back(rnd(0, n_vocab - 1));
++        }
++        const int n_acc = rnd(1, n_draft + 1);
++        const llama_token next = rnd(0, n_vocab - 1);
++
++        std::vector<llama_token> vt = { last };
++        vt.insert(vt.end(), draft.begin(), draft.end());
++
++        for (pair_ctx * p : pairs) {
++            // --- drafts (the MTP KV region >= pos was dropped at the end of the previous step)
++            if (mtp) {
++                std::vector<float> h = p->pending_h;
++                for (int d = 0; d < n_draft; d++) {
++                    batchd.n_tokens = 1;
++                    batchd.token[0] = d == 0 ? last : draft[d - 1];
++                    batchd.pos[0] = pos + d; batchd.n_seq_id[0] = 1; batchd.seq_id[0][0] = 0; batchd.logits[0] = 1;
++                    memcpy(batchd.embd, h.data(), n_embd * sizeof(float));
++                    int64_t t0 = ggml_time_us();
++                    GGML_ASSERT(llama_decode(p->dft.get(), batchd) == 0);
++                    p->tm.add("dft.draft.n1", t0);
++                    t0 = ggml_time_us();
++                    const float * lg = llama_get_logits_ith(p->dft.get(), 0); // the sampler's synchronize
++                    p->tm.add("dft.draft.sync+read", t0);
++                    push(*p, lg, n_vocab_out);
++                    const float * hr = llama_get_embeddings_nextn_ith(p->dft.get(), 0);
++                    memcpy(h.data(), hr, n_embd * sizeof(float));
++                    push(*p, hr, n_embd);
++                }
++                const int64_t t0 = ggml_time_us();
++                llama_memory_seq_rm(llama_get_memory(p->dft.get()), 0, pos, -1);
++                p->tm.add("dft.seq_rm", t0);
++            }
++
++            // --- verify + synchronize (server decode())
++            common_batch_clear(batch);
++            for (int k = 0; k < (int) vt.size(); k++) {
++                common_batch_add(batch, vt[k], pos + k, { 0 }, true);
++            }
++            int64_t t0 = ggml_time_us();
++            GGML_ASSERT(llama_decode(p->tgt.get(), batch) == 0);
++            p->tm.add("tgt.verify.n" + std::to_string(vt.size()), t0);
++            llama_synchronize(p->tgt.get());
++
++            // --- MTP catch-up of the whole verify batch, left in flight (server spec_process)
++            if (mtp) {
++                const float * h_tgt = llama_get_embeddings_nextn(p->tgt.get());
++                batchd.n_tokens = (int) vt.size();
++                for (int k = 0; k < (int) vt.size(); k++) {
++                    batchd.token[k] = vt[k]; batchd.pos[k] = pos + k; batchd.n_seq_id[k] = 1; batchd.seq_id[k][0] = 0; batchd.logits[k] = 0;
++                    const float * src = k == 0 ? p->pending_h.data() : h_tgt + (size_t) (k - 1) * n_embd;
++                    memcpy(batchd.embd + (size_t) k * n_embd, src, n_embd * sizeof(float));
++                }
++                t0 = ggml_time_us();
++                GGML_ASSERT(llama_decode(p->dft.get(), batchd) == 0);
++                p->tm.add("dft.catchup.n" + std::to_string(vt.size()), t0);
++            }
++
++            // --- read the target outputs while the catch-up may still run (process_h_rows + sample_accept)
++            t0 = ggml_time_us();
++            for (int k = 0; k < (int) vt.size(); k++) {
++                push(*p, llama_get_logits_ith(p->tgt.get(), k), n_vocab_out);
++                if (mtp) {
++                    push(*p, llama_get_embeddings_nextn_ith(p->tgt.get(), k), n_embd);
++                }
++            }
++            p->tm.add("tgt.read_outputs", t0);
++
++            // --- accept n_acc of the verify tokens, roll back the rest
++            if (mtp) {
++                memcpy(p->pending_h.data(), llama_get_embeddings_nextn_ith(p->tgt.get(), n_acc - 1), n_embd * sizeof(float));
++            }
++            t0 = ggml_time_us();
++            if (n_acc < (int) vt.size() && !llama_memory_seq_rm(llama_get_memory(p->tgt.get()), 0, pos + n_acc, -1)) {
++                fprintf(stderr, "tgt seq_rm failed (rollback %d)\n", (int) vt.size() - n_acc);
++                return 1;
++            }
++            p->tm.add("tgt.seq_rm", t0);
++            if (mtp) {
++                t0 = ggml_time_us();
++                llama_memory_seq_rm(llama_get_memory(p->dft.get()), 0, pos + n_acc, -1);
++                p->tm.add("dft.seq_rm", t0);
++            }
++        }
++        compare_step(step, "step outputs");
++
++        n_verify_tokens += vt.size();
++        pos += n_acc;
++        last = next;
++
++        // every 100 steps: a 40-token turn (bigger than LLAMA_GRAPH_REUSE_MULTI_TOKENS -> the gf_res_prev path and a
++        // different allocation), then generation continues on the cached small graphs
++        if ((step + 1) % 100 == 0 && pos + 60 < (llama_pos) n_ctx) {
++            std::vector<llama_token> turn;
++            for (int i = 0; i < 40; i++) {
++                turn.push_back(rnd(0, n_vocab - 1));
++            }
++            turn[0] = last;
++            for (pair_ctx * p : pairs) {
++                common_batch_clear(batch);
++                for (int i = 0; i < 40; i++) {
++                    common_batch_add(batch, turn[i], pos + i, { 0 }, i == 39);
++                }
++                GGML_ASSERT(llama_decode(p->tgt.get(), batch) == 0);
++                push(*p, llama_get_logits_ith(p->tgt.get(), -1), n_vocab_out);
++                if (mtp) {
++                    const float * h_tgt = llama_get_embeddings_nextn(p->tgt.get());
++                    batchd.n_tokens = 40;
++                    for (int k = 0; k < 40; k++) {
++                        batchd.token[k] = turn[k]; batchd.pos[k] = pos + k; batchd.n_seq_id[k] = 1; batchd.seq_id[k][0] = 0; batchd.logits[k] = 0;
++                        const float * src = k == 0 ? p->pending_h.data() : h_tgt + (size_t) (k - 1) * n_embd;
++                        memcpy(batchd.embd + (size_t) k * n_embd, src, n_embd * sizeof(float));
++                    }
++                    memcpy(p->pending_h.data(), h_tgt + (size_t) 39 * n_embd, n_embd * sizeof(float));
++                    GGML_ASSERT(llama_decode(p->dft.get(), batchd) == 0);
++                    llama_synchronize(p->dft.get());
++                }
++            }
++            compare_step(step, "turn outputs");
++            pos += 40;
++            last = rnd(0, n_vocab - 1);
++        }
++        if ((step + 1) % 100 == 0) {
++            fprintf(stderr, "step %d pos %d compared %d mismatches %d\n", step + 1, pos, n_compared, n_mismatch);
++        }
++    }
++    for (pair_ctx * p : pairs) {
++        llama_synchronize(p->tgt.get());
++        if (mtp) {
++            llama_synchronize(p->dft.get());
++        }
++    }
++
++    for (pair_ctx * p : pairs) {
++        const char * name = p == &A ? "A(ref)" : (multi_b ? "B(multi)" : "B(ref2)");
++        fprintf(stderr, "== %s: tgt graphs reused %d", name, llama_perf_context(p->tgt.get()).n_reused);
++        if (mtp) {
++            fprintf(stderr, ", dft graphs reused %d", llama_perf_context(p->dft.get()).n_reused);
++        }
++        fprintf(stderr, "\n");
++        for (auto & kv : p->tm.acc) {
++            fprintf(stderr, "   %-22s n=%6lld avg=%8.3f ms (host)\n", kv.first.c_str(),
++                    (long long) kv.second.first, kv.second.second / kv.second.first);
++        }
++    }
++    fprintf(stderr, "HOSTV-REUSE %s: steps_compared=%d mismatches=%d final_pos=%d verify_tokens=%d checksum=%016llx\n",
++            n_mismatch == 0 ? "PASS" : "FAIL", n_compared, n_mismatch, pos, n_verify_tokens, (unsigned long long) checksum);
++
++    batchd.token = nullptr;
++    llama_batch_free(batch);
++    llama_batch_free(batchd);
++    for (pair_ctx * p : pairs) {
++        p->tgt.reset();
++        p->dft.reset();
++    }
++    model.reset();
++    llama_backend_free();
++    return n_mismatch == 0 ? 0 : 1;
++}
+diff --git a/tests/test-hostv-sampling.cpp b/tests/test-hostv-sampling.cpp
+new file mode 100644
+index 0000000000..ebc63ac13e
+--- /dev/null
++++ b/tests/test-hostv-sampling.cpp
+@@ -0,0 +1,235 @@
++// LOCAL (hostv): host cost + exactness probe of the server's speculative sample-and-accept step.
++//
++// A random tiny QWEN35 on the CPU backend with the production vocabulary size produces real target logits for an
++// 8-token verify batch; then, per trial (fixed seeds), a sampler with the production chain (top-k 20, top-p 0.95,
++// temp 1.0, min-p default, LLAMA_SAMPLER_FAST_TOPK) runs common_sampler_sample_and_accept_n_rejection on a random
++// draft with random draft distributions, exactly like srv.sample_accept (including the sampler clone the server
++// takes first). Prints the host time per call and per sampled position, and a checksum of all accepted tokens so
++// that two builds / env settings can be compared token for token.
++//
++// usage: test-hostv-sampling [trials=2000] [n_vocab=248320] [seed=1]
++#include "common.h"
++#include "sampling.h"
++#include "ggml-backend.h"
++#include "ggml-cpp.h"
++#include "gguf.h"
++#include "llama.h"
++#include "llama-cpp.h"
++
++#include "../src/llama-arch.h"
++#include "../src/llama-model-saver.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
++    const size_t seed0 = *(const size_t *) userdata;
++    std::hash<std::string> hasher;
++    std::mt19937 gen(seed0 ^ hasher(tensor->name));
++    // wide logits so top-p keeps a varying number of candidates
++    std::normal_distribution<float> dis(0.0f, strstr(tensor->name, "output") ? 0.6f : 0.1f);
++    const bool is_ssm_a = strstr(tensor->name, "ssm_a") != nullptr;
++    const int64_t ne = ggml_nelements(tensor);
++    if (tensor->type == GGML_TYPE_F32) {
++        std::vector<float> tmp(ne);
++        for (auto & v : tmp) { const float x = dis(gen); v = is_ssm_a ? -fabsf(x) : x; }
++        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
++    } else if (tensor->type == GGML_TYPE_F16) {
++        std::vector<ggml_fp16_t> tmp(ne);
++        for (auto & v : tmp) { const float x = dis(gen); v = ggml_fp32_to_fp16(is_ssm_a ? -fabsf(x) : x); }
++        ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
++    } else {
++        GGML_ABORT("unexpected type");
++    }
++}
++
++static gguf_context_ptr make_model(uint32_t n_vocab) {
++    gguf_context_ptr ret(gguf_init_empty());
++    llama_model_saver ms(LLM_ARCH_QWEN35, ret.get());
++    const uint32_t n_embd = 64, n_head = 1, n_embd_head = n_embd / n_head;
++    ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,        llm_arch_name(LLM_ARCH_QWEN35));
++    ms.add_kv(LLM_KV_VOCAB_SIZE,                  n_vocab);
++    ms.add_kv(LLM_KV_CONTEXT_LENGTH,              uint32_t(4096));
++    ms.add_kv(LLM_KV_EMBEDDING_LENGTH,            n_embd);
++    ms.add_kv(LLM_KV_BLOCK_COUNT,                 uint32_t(4));
++    ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH,         uint32_t(128));
++    ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL,     uint32_t(4));
++    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,        n_head);
++    ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV,     n_head);
++    ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
++    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,     std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
++    ms.add_kv(LLM_KV_SSM_INNER_SIZE,              uint32_t(128));
++    ms.add_kv(LLM_KV_SSM_CONV_KERNEL,             uint32_t(4));
++    ms.add_kv(LLM_KV_SSM_STATE_SIZE,              uint32_t(64));
++    ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,          uint32_t(2));
++    ms.add_kv(LLM_KV_SSM_GROUP_COUNT,             uint32_t(2));
++    std::vector<std::string> list(n_vocab);
++    std::vector<float>       scores(n_vocab, 0.0f);
++    ms.add_kv(LLM_KV_TOKENIZER_MODEL, "test");
++    for (uint32_t i = 0; i < n_vocab; i++) {
++        list[i] = "tok_" + std::to_string(i);
++    }
++    ms.add_kv(LLM_KV_TOKENIZER_LIST,   list);
++    ms.add_kv(LLM_KV_TOKENIZER_SCORES, scores);
++    return ret;
++}
++
++int main(int argc, char ** argv) {
++    const int      trials  = argc > 1 ? atoi(argv[1]) : 2000;
++    const uint32_t n_vocab = argc > 2 ? atoi(argv[2]) : 248320;
++    const size_t   seed    = argc > 3 ? atoll(argv[3]) : 1;
++
++    llama_backend_init();
++    auto gguf = make_model(n_vocab);
++    llama_model_params mp = llama_model_default_params();
++    std::vector<ggml_backend_dev_t> devs = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
++    mp.devices = devs.data();
++    size_t wseed = seed;
++    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &wseed, mp));
++    GGML_ASSERT(model);
++    llama_context_params cp = llama_context_default_params();
++    cp.n_ctx = 512; cp.n_batch = 64; cp.n_ubatch = 64; cp.n_seq_max = 1;
++    llama_context_ptr ctx(llama_init_from_model(model.get(), cp));
++    GGML_ASSERT(ctx);
++
++    std::mt19937 rng(seed);
++    llama_batch batch = llama_batch_init(64, 0, 1);
++    for (int i = 0; i < 16; i++) {
++        common_batch_add(batch, std::uniform_int_distribution<int>(0, n_vocab - 1)(rng), i, { 0 }, i >= 8);
++    }
++    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
++    llama_synchronize(ctx.get());
++
++    common_params_sampling sp;
++    sp.top_k = 20;
++    sp.top_p = 0.95f;
++    sp.temp  = 1.0f;
++
++    std::vector<int> idxs(8);
++    for (int i = 0; i < 8; i++) {
++        idxs[i] = 8 + i;
++    }
++
++    double t_total = 0, t_clone = 0;
++    int64_t n_pos = 0;
++    uint64_t checksum = 1469598103934665603ull;
++    for (int t = 0; t < trials; t++) {
++        sp.seed = (uint32_t) (seed * 1000003 + t);
++        common_sampler_ptr smpl(common_sampler_init(model.get(), sp));
++
++        // draft: 7 tokens taken from the target top candidates (so a varying prefix gets accepted), q peaked on them
++        const int n_draft = 7;
++        llama_tokens draft;
++        std::vector<std::vector<llama_token_data>> draft_q;
++        {
++            common_sampler_ptr probe(common_sampler_init(model.get(), sp));
++            for (int i = 0; i < n_draft; i++) {
++                common_sampler_sample(probe.get(), ctx.get(), idxs[i]);
++                const auto * cur = common_sampler_get_candidates(probe.get(), true);
++                const int pick = std::uniform_int_distribution<int>(0, std::min<int>(3, (int) cur->size - 1))(rng);
++                draft.push_back(cur->data[pick].id);
++                std::vector<llama_token_data> q(cur->data, cur->data + cur->size);
++                for (auto & e : q) {
++                    const float qd = (t % 3 == 0) ? 0.7f : (t % 3 == 1) ? 0.05f : 0.001f; // vary the acceptance depth
++                    e.p = e.id == draft.back() ? qd : (1.0f - qd) / std::max<size_t>(1, q.size() - 1);
++                }
++                draft_q.push_back(q);
++            }
++        }
++
++        const int64_t t0 = ggml_time_us();
++        common_sampler_ptr save(common_sampler_clone(smpl.get()));
++        const int64_t t1 = ggml_time_us();
++        const auto acc = common_sampler_sample_and_accept_n_rejection(smpl.get(), ctx.get(), idxs, draft, draft_q, false);
++        const int64_t t2 = ggml_time_us();
++        t_clone += (t1 - t0) / 1000.0;
++        t_total += (t2 - t0) / 1000.0;
++        n_pos   += (int64_t) acc.size();
++        for (auto id : acc) {
++            checksum = (checksum ^ (uint64_t) (uint32_t) id) * 1099511628211ull;
++        }
++        checksum = (checksum ^ 0xABCDu) * 1099511628211ull;
++    }
++    fprintf(stderr, "HOSTV-SAMPLING trials=%d n_vocab=%u: sample_accept %.4f ms/call (clone %.4f), %.2f positions/call, %.4f ms/position, checksum=%016llx\n",
++            trials, n_vocab, t_total / trials, t_clone / trials, (double) n_pos / trials, t_total / n_pos, (unsigned long long) checksum);
++
++    // breakdown: logits access, one full common_sampler_sample, and the raw top-k selection pass
++    {
++        const int N = 500;
++        common_sampler_ptr smpl(common_sampler_init(model.get(), sp));
++        fprintf(stderr, "HOSTV-SAMPLING chain: %s\n", common_sampler_print(smpl.get()).c_str());
++        int64_t t0 = ggml_time_us();
++        float acc_f = 0.0f;
++        for (int i = 0; i < N; i++) {
++            acc_f += llama_get_logits_ith(ctx.get(), 8 + (i & 7))[i & 1023];
++        }
++        const double t_logits = (ggml_time_us() - t0) / 1000.0 / N;
++        t0 = ggml_time_us();
++        llama_token tacc = 0;
++        for (int i = 0; i < N; i++) {
++            tacc += common_sampler_sample(smpl.get(), ctx.get(), 8 + (i & 7));
++        }
++        const double t_sample = (ggml_time_us() - t0) / 1000.0 / N;
++        // the max pass alone (what select_top_k does for every 64-float block)
++        t0 = ggml_time_us();
++        float mx = 0.0f;
++        for (int i = 0; i < N; i++) {
++            const float * lg = llama_get_logits_ith(ctx.get(), 8 + (i & 7));
++            float m = lg[0];
++            for (uint32_t j = 1; j < n_vocab; j++) {
++                m = std::max(m, lg[j]);
++            }
++            mx += m;
++        }
++        const double t_max = (ggml_time_us() - t0) / 1000.0 / N;
++        // a copy of common_sampler::select_top_k (k = 20)
++        t0 = ggml_time_us();
++        std::vector<llama_token_data> cur;
++        for (int i = 0; i < N; i++) {
++            const float * logits = llama_get_logits_ith(ctx.get(), 8 + (i & 7));
++            const int k = 20;
++            auto better = [](const llama_token_data & a, const llama_token_data & b) {
++                return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
++            };
++            cur.resize(k);
++            for (int j = 0; j < k; ++j) {
++                cur[j] = llama_token_data{j, logits[j], 0.0f};
++            }
++            std::make_heap(cur.begin(), cur.end(), better);
++            float thr = cur[0].logit;
++            constexpr int B = 64;
++            for (int j0 = k, end; j0 < (int) n_vocab; j0 = end) {
++                end = std::min((int) n_vocab, (j0 / B + 1) * B);
++                float m = logits[j0];
++                for (int j = j0 + 1; j < end; ++j) {
++                    m = std::max(m, logits[j]);
++                }
++                if (!(m > thr)) {
++                    continue;
++                }
++                for (int j = j0; j < end; ++j) {
++                    const float l = logits[j];
++                    if (l > thr) {
++                        std::pop_heap(cur.begin(), cur.end(), better);
++                        cur.back() = llama_token_data{j, l, 0.0f};
++                        std::push_heap(cur.begin(), cur.end(), better);
++                        thr = cur[0].logit;
++                    }
++                }
++            }
++            std::sort(cur.begin(), cur.end(), better);
++        }
++        const double t_topk = (ggml_time_us() - t0) / 1000.0 / N;
++        fprintf(stderr, "HOSTV-SAMPLING breakdown: llama_get_logits_ith %.4f ms, common_sampler_sample %.4f ms, plain max pass %.4f ms, select_top_k copy %.4f ms (%g %d %g %d)\n",
++                t_logits, t_sample, t_max, t_topk, acc_f, tacc, mx, cur[0].id);
++    }
++    llama_batch_free(batch);
++    ctx.reset();
++    model.reset();
++    llama_backend_free();
++    return 0;
++}
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 7bf1138c8a..a874f52dbf 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -645,6 +645,16 @@ llama_tokens server_tokens::get_text_tokens() const {
+     return res;
+ }
+ 
++void server_tokens::get_text_tokens(llama_tokens & out) const {
++    out.clear();
++    out.reserve(tokens.size());
++    for (llama_token t : tokens) {
++        if (t != LLAMA_TOKEN_NULL) {
++            out.push_back(t);
++        }
++    }
++}
++
+ void server_tokens::set_token(llama_pos pos, llama_token id) {
+     GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+     tokens[pos] = id;
+diff --git a/tools/server/server-common.h b/tools/server/server-common.h
+index 9894f5f06f..039690ff56 100644
+--- a/tools/server/server-common.h
++++ b/tools/server/server-common.h
+@@ -211,6 +211,7 @@ public:
+     const llama_tokens & get_tokens() const;
+ 
+     llama_tokens get_text_tokens() const;
++    void get_text_tokens(llama_tokens & out) const; // [hostv] same content, reuses out's capacity
+ 
+     std::vector<char> serialize() const;
+     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 89b8f45260..2573de51e2 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2965,6 +2965,14 @@ private:
+     }
+ 
+     void pre_decode() {
++        // [hostv] LLAMA_HOST_PROF: srv.pre.head = start of pre_decode .. drafting, srv.pre.tail = after drafting .. end
++        const int64_t hp_pre_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
++        int64_t hp_pre_t1 = 0;
++        struct hp_pre_rec {
++            const int64_t & t1; const server_batch & b;
++            ~hp_pre_rec() { if (t1 && b.size() > 0 && b.size() <= 16) llama_hprof_record("srv.pre.tail", t1); }
++        } hp_pre_r { hp_pre_t1, batch };
++
+         // apply context-shift if needed
+         // TODO: simplify and improve
+         iterate(slots, [&](server_slot & slot) {
+@@ -3084,7 +3092,7 @@ private:
+                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                         }
+ 
+-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
++                        slot.prompt.tokens.get_text_tokens(slot.spec_prompt); // [hostv] in place
+ 
+                         const bool spec_reject = slot.use_spec_rejection();
+ 
+@@ -3105,6 +3113,10 @@ private:
+             }
+         });
+ 
++        if (hp_pre_t0 && !drafting.empty()) {
++            llama_hprof_record("srv.pre.head", hp_pre_t0);
++        }
++
+         // generate the actual drafts (if any)
+         if (!drafting.empty()) {
+             const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
+@@ -3116,6 +3128,10 @@ private:
+             }
+         }
+ 
++        if (hp_pre_t0 && !drafting.empty()) {
++            hp_pre_t1 = ggml_time_us();
++        }
++
+         // make checkpoints if needed
+         iterate(drafting, [&](server_slot & slot) {
+             auto & draft = slot.spec_draft;
+@@ -4095,7 +4111,16 @@ private:
+             slot.sampled = ids.back(); // last accepted token
+             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
+ 
+-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
++            {
++                const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
++                slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
++                if (hp_t0) {
++                    llama_hprof_record("srv.post.seq_rm", hp_t0);
++                }
++            }
++
++            const int64_t hp_tok_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
++            struct hp_tok_rec { int64_t t0; ~hp_tok_rec() { if (t0) llama_hprof_record("srv.post.process_tokens", t0); } } hp_tok_r { hp_tok_t0 };
+ 
+             for (size_t i = 0; i < ids.size(); ++i) {
+                 completion_token_output result;

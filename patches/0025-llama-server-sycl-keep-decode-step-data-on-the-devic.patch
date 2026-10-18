@@ -1,0 +1,1168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Mon, 28 Sep 2026 15:45:59 -0600
+Subject: [PATCH 25/27] llama/server/sycl : keep decode-step data on the device
+
+The decode step of MTP speculative decoding is GPU-bound; what is left
+on the bus per step is moved to the device. Env switches, default off,
+outputs unchanged:
+- LLAMA_TGT_TOPK_DEVICE: the target's top-21 logits per row are selected
+  on the device and only those are downloaded; the CPU sampler runs on
+  them and reads the full row when values tie or a grammar / reasoning
+  budget needs it (=2 verifies every row against the full-row path)
+- LLAMA_KV_ROT_DEVICE: the rotation matrices of a quantized draft KV are
+  uploaded once instead of before every graph
+- GGML_SYCL_ASYNC_INPUTS=2: host-computed embedding rows are uploaded
+  without waiting for the whole queue
+- GGML_TRACE=<file>: GPU/host timeline of graphs and copies from the
+  queue's completion events (no commands added to the queue)
+
+Assisted-by: Claude Opus 5.5
+---
+ common/sampling.cpp              | 146 ++++++++++++++++++----
+ common/sampling.h                |   7 ++
+ ggml/include/ggml-backend.h      |  10 ++
+ ggml/src/ggml-backend.cpp        | 137 +++++++++++++++++++-
+ ggml/src/ggml-sycl/ggml-sycl.cpp | 206 +++++++++++++++++++++++++++++++
+ src/llama-context.cpp            |  68 ++++++++--
+ src/llama-context.h              |   6 +
+ src/llama-ext.h                  |   4 +
+ src/llama-kv-cache.cpp           |  61 +++++++++
+ src/llama-kv-cache.h             |   8 ++
+ tools/server/server-context.cpp  |  57 ++++++++-
+ 11 files changed, 672 insertions(+), 38 deletions(-)
+
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index ad41608531..145796e834 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -4,6 +4,7 @@
+ #include "fit.h"
+ #include "log.h"
+ #include "reasoning-budget.h"
++#include "../src/llama-ext.h" // [decodeidle] llama_get_logits_ith_fetch
+ 
+ #include "ggml.h"
+ 
+@@ -131,7 +132,30 @@ struct common_sampler {
+         llama_sampler_reset(chain);
+     }
+ 
+-    void set_logits(struct llama_context * ctx, int idx) {
++    // the original host path over a raw logits row
++    void set_logits_raw(const float * logits, int n_vocab) {
++        // [step-proto] the chain's first effective sampler is top_k(k): select the k best logits in one
++        // pass instead of materialising n_vocab token_data and partial-sorting them (same set, same order)
++        const int32_t k = fast_top_k();
++        if (k > 0 && k < n_vocab) {
++            select_top_k(logits, n_vocab, k);
++            if (fast_top_k_mode() == 2) {
++                check_top_k(logits, n_vocab, k);
++            }
++            cur_p = { cur.data(), cur.size(), -1, true };
++            return;
++        }
++
++        cur.resize(n_vocab);
++        for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
++            cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
++        }
++        cur_p = { cur.data(), cur.size(), -1, false };
++    }
++
++    // force_full [decodeidle]: the caller needs the whole vocab row (grammar before the chain, reasoning-budget forcing,
++    // grammar resampling); only relevant when the device computed the top-k candidates (LLAMA_TGT_TOPK_DEVICE)
++    void set_logits(struct llama_context * ctx, int idx, bool force_full = false) {
+         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
+@@ -141,6 +165,62 @@ struct common_sampler {
+ 
+         const int n_vocab = llama_vocab_n_tokens(vocab);
+ 
++        // [decodeidle] LLAMA_TGT_TOPK_DEVICE: the device returned the top_k+1 logits of this row. The host path over the
++        // full row keeps exactly the top_k of them in the same order unless two of those k+1 values are equal (then the
++        // order of the equal ones depends on the selection algorithm): in that case, and whenever the caller needs the
++        // whole row, the raw row is read from the device and the original path runs. NaNs also fail the strict test.
++        const int32_t k_dev = tgt_topk_device_k();
++        if (k_dev > 0 && !sampled_probs && sampled_logits) {
++            const uint32_t cnt = llama_get_sampled_logits_count_ith(ctx, idx);
++            bool full = force_full || cnt != (uint32_t) k_dev + 1;
++            if (!full) {
++                topk_vals.assign(sampled_logits, sampled_logits + cnt);
++                std::sort(topk_vals.begin(), topk_vals.end(), std::greater<float>());
++                bool distinct = true;
++                for (size_t i = 0; i + 1 < topk_vals.size(); ++i) {
++                    distinct = distinct && (topk_vals[i] > topk_vals[i + 1]);
++                }
++                if (!distinct) {
++                    full = true;
++                    n_topk_fallback++;
++                }
++            } else {
++                n_topk_full++;
++            }
++            if (full) {
++                const float * row = llama_get_logits_ith_fetch(ctx, idx);
++                GGML_ASSERT(row != nullptr && "LLAMA_TGT_TOPK_DEVICE: cannot read the raw logits row");
++                set_logits_raw(row, n_vocab);
++                return;
++            }
++            cur.resize(cnt);
++            for (uint32_t i = 0; i < cnt; i++) {
++                cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
++            }
++            cur_p = { cur.data(), cur.size(), -1, false };
++            if (tgt_topk_check_mode()) {
++                // LLAMA_TGT_TOPK_DEVICE=2: compare with the full-row selection, abort on any difference, continue with it
++                std::vector<llama_token_data> got(cur.begin(), cur.end());
++                std::stable_sort(got.begin(), got.end(), [](const llama_token_data & x, const llama_token_data & y) { return x.logit > y.logit; });
++                got.resize(k_dev);
++                const float * row = llama_get_logits_ith_fetch(ctx, idx);
++                GGML_ASSERT(row != nullptr);
++                select_top_k(row, n_vocab, k_dev);
++                for (int i = 0; i < k_dev; ++i) {
++                    if (got[i].id != cur[i].id || memcmp(&got[i].logit, &cur[i].logit, sizeof(float)) != 0) {
++                        GGML_ABORT("LLAMA_TGT_TOPK_DEVICE=2: candidate %d differs: id %d vs %d", i, got[i].id, cur[i].id);
++                    }
++                }
++                static int64_t n_ok = 0;
++                if ((++n_ok & (n_ok - 1)) == 0) {
++                    LOG_INF("%s: LLAMA_TGT_TOPK_DEVICE=2: %lld rows identical to the full-row selection (%lld tie fallbacks, %lld full-row reads)\n",
++                            __func__, (long long) n_ok, (long long) n_topk_fallback, (long long) n_topk_full);
++                }
++                set_logits_raw(row, n_vocab);
++            }
++            return;
++        }
++
+         if (sampled_probs) {
+             const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
+             cur.resize(sampled_probs_count);
+@@ -156,28 +236,27 @@ struct common_sampler {
+         } else {
+             const auto * logits = llama_get_logits_ith(ctx, idx);
+             GGML_ASSERT(logits != nullptr);
+-
+-            // [step-proto] the chain's first effective sampler is top_k(k): select the k best logits in one
+-            // pass instead of materialising n_vocab token_data and partial-sorting them (same set, same order)
+-            const int32_t k = fast_top_k();
+-            if (k > 0 && k < n_vocab) {
+-                select_top_k(logits, n_vocab, k);
+-                if (fast_top_k_mode() == 2) {
+-                    check_top_k(logits, n_vocab, k);
+-                }
+-                cur_p = { cur.data(), cur.size(), -1, true };
+-                return;
+-            }
+-
+-            cur.resize(n_vocab);
+-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+-            }
++            set_logits_raw(logits, n_vocab);
++            return;
+         }
+ 
+         cur_p = { cur.data(), cur.size(), -1, false };
+     }
+ 
++    // [decodeidle] LLAMA_TGT_TOPK_DEVICE=1: k of the chain's leading top-k when this sampler's context computes the
++    // top_k+1 candidates on the device (set by the server through common_sampler_set_tgt_topk_device), else 0
++    int32_t tgt_topk_device_k() const {
++        return tgt_topk_k;
++    }
++    int32_t tgt_topk_k = 0;
++    static bool tgt_topk_check_mode() {
++        static const bool v = getenv("LLAMA_TGT_TOPK_DEVICE") && atoi(getenv("LLAMA_TGT_TOPK_DEVICE")) == 2;
++        return v;
++    }
++    int64_t n_topk_fallback = 0;
++    int64_t n_topk_full     = 0;
++    std::vector<float> topk_vals;
++
+     // env LLAMA_SAMPLER_FAST_TOPK=1: returns top_k when everything the chain runs before top-k is a no-op
+     // (no logit bias / suppress list, neutral penalties, DRY and top-n-sigma off) and no grammar or reasoning
+     // budget sees the full vocab; 0 otherwise
+@@ -188,8 +267,13 @@ struct common_sampler {
+     }
+ 
+     int32_t fast_top_k() const {
+-        const bool enabled = fast_top_k_mode() != 0;
+-        if (!enabled || grmr || rbudget || params.mirostat != 0 || params.top_k <= 0) {
++        return fast_top_k_mode() != 0 ? chain_top_k_first() : 0;
++    }
++
++    // top_k when everything the chain runs before top-k is a no-op (and no grammar / reasoning budget), else 0
++    // relaxed [decodeidle]: grammar and reasoning budget allowed (the caller handles them per row with set_logits(force_full))
++    int32_t chain_top_k_first(bool relaxed = false) const {
++        if ((!relaxed && (grmr || rbudget)) || params.mirostat != 0 || params.top_k <= 0) {
+             return 0;
+         }
+         const int n = llama_sampler_chain_n(chain);
+@@ -718,6 +802,21 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
+     }
+ }
+ 
++// [decodeidle] LLAMA_TGT_TOPK_DEVICE
++int32_t common_sampler_chain_top_k(const struct common_sampler * gsmpl) {
++    return gsmpl ? gsmpl->chain_top_k_first(/*relaxed =*/ true) : 0;
++}
++
++void common_sampler_set_tgt_topk_device(struct common_sampler * gsmpl, int32_t k) {
++    if (gsmpl) {
++        gsmpl->tgt_topk_k = k;
++    }
++}
++
++int64_t common_sampler_tgt_topk_fallbacks(const struct common_sampler * gsmpl) {
++    return gsmpl ? gsmpl->n_topk_fallback : 0;
++}
++
+ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
+     if (!gsmpl) {
+         return nullptr;
+@@ -739,7 +838,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     auto & chain = gsmpl->chain;
+     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+ 
+-    gsmpl->set_logits(ctx, idx);
++    // [decodeidle] LLAMA_TGT_TOPK_DEVICE: a grammar applied before the chain or a forcing reasoning budget sees the whole row
++    const bool need_full = (rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING) ||
++                           (grammar_first && grammar_should_apply(gsmpl));
++    gsmpl->set_logits(ctx, idx, need_full);
+ 
+     // Check if a backend sampler has already sampled a token in which case we
+     // return that token id directly.
+@@ -793,7 +895,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+ 
+     // resampling:
+     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
+-    gsmpl->set_logits(ctx, idx);
++    gsmpl->set_logits(ctx, idx, /*force_full =*/ true);
+ 
+     llama_sampler_apply(rbudget,  &cur_p);
+ 
+diff --git a/common/sampling.h b/common/sampling.h
+index 64d31c3f46..8ea89ef76b 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -55,6 +55,13 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
+ // get the underlying llama_sampler_chain
+ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+ 
++// [decodeidle] LLAMA_TGT_TOPK_DEVICE: k of the chain's leading top-k sampler if every sampler before it is a no-op and
++// there is no grammar / reasoning budget / mirostat (else 0); mark the sampler's context as computing the top k+1
++// candidates on the device (0 = off); number of rows that fell back to the raw logits because of equal values
++int32_t common_sampler_chain_top_k(const struct common_sampler * gsmpl);
++void    common_sampler_set_tgt_topk_device(struct common_sampler * gsmpl, int32_t k);
++int64_t common_sampler_tgt_topk_fallbacks(const struct common_sampler * gsmpl);
++
+ // extended sampling implementation:
+ //
+ // - set logits
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index d12b6a185e..88751f8634 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -440,6 +440,16 @@ extern "C" {
+     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
+     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
+ 
++    // [decodeidle] LOCAL timeline trace, env GGML_TRACE=<file> (default off; every call is a no-op when off).
++    // Records host intervals (ggml_time_us clock) and device timestamps (backend clock, ns) into memory; the records
++    // are written to <file> by ggml_trace_flush() (and when the buffer fills up, and at exit). A backend registers a
++    // resolver that turns its pending device tags into ggml_trace_dev() records before a flush.
++    GGML_API bool ggml_trace_on(void);
++    GGML_API void ggml_trace_host(const char * name, int64_t t0_us, int64_t t1_us, int64_t arg);
++    GGML_API void ggml_trace_dev (const char * name, int64_t t_host_us, int64_t dev_ns, int64_t arg);
++    GGML_API void ggml_trace_set_resolver(void (*fn)(void));
++    GGML_API void ggml_trace_flush(void);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index d1eb467891..861dae8e27 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1684,8 +1684,27 @@ static bool ggml_sched_async_inputs_env() {
+     return on;
+ }
+ 
+-static bool ggml_sched_input_stageable(const ggml_tensor * input, const ggml_tensor * input_cpy) {
+-    return (input->flags & GGML_TENSOR_FLAG_INPUT) && input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
++// [decodeidle] GGML_SYCL_ASYNC_INPUTS=2: also stage split inputs that a CPU split computed in host memory (e.g. the
++// token-embedding GET_ROWS of the target and of the MTP draft, whose tok_embd stays on the host). Without it such an
++// input waits for the whole device queue (ggml_backend_synchronize: no sched events with one copy) and is then copied
++// with a blocking set_tensor, so e.g. the first MTP draft decode of a step cannot be submitted before the catch-up
++// graph has finished. The CPU backend computes synchronously, so the bytes are final when they are captured; the
++// in-order queue orders the upload after every earlier graph that still reads the destination.
++static bool ggml_sched_async_cpu_inputs_env() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_SYCL_ASYNC_INPUTS");
++        return e && atoi(e) >= 2;
++    }();
++    return on;
++}
++
++static bool ggml_sched_input_stageable(const ggml_tensor * input, const ggml_tensor * input_cpy,
++                                       ggml_backend_t input_backend = nullptr) {
++    const bool src_ok = (input->flags & GGML_TENSOR_FLAG_INPUT) ||
++                        (ggml_sched_async_cpu_inputs_env() && input_backend &&
++                         ggml_backend_get_device(input_backend) &&
++                         ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU);
++    return src_ok && input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
+            input->data && ggml_is_contiguous(input) && input_cpy->buffer && ggml_nbytes(input) == ggml_nbytes(input_cpy);
+ }
+ 
+@@ -1867,7 +1886,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             size_t st_total = 0;
+             for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                 struct ggml_tensor * input = split->inputs[input_id];
+-                if (ggml_sched_input_stageable(input, tensor_copy(input, split_backend_id, sched->cur_copy))) {
++                if (ggml_sched_input_stageable(input, tensor_copy(input, split_backend_id, sched->cur_copy),
++                                               ggml_backend_sched_get_tensor_backend(sched, input))) {
+                     st_total += GGML_PAD(ggml_nbytes(input), 256);
+                 }
+             }
+@@ -1899,7 +1919,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 }
+             }
+ 
+-            if (st_beg != SIZE_MAX && ggml_sched_input_stageable(input, input_cpy)) {
++            if (st_beg != SIZE_MAX && ggml_sched_input_stageable(input, input_cpy, input_backend)) {
+                 // [spechost] staged upload: capture the bytes now, upload from the pinned ring without blocking
+                 const size_t n = ggml_nbytes(input);
+                 char * src = sched->istage->base + st_off;
+@@ -2896,3 +2916,112 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
+     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
+     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+ }
++
++// ---- [decodeidle] LOCAL timeline trace (GGML_TRACE=<file>, default off) ----
++#include <mutex>
++namespace {
++struct ggml_trace_rec {
++    char    kind;       // 'H' host interval, 'D' device timestamp
++    char    name[39];
++    int64_t t0;         // H: start us, D: host us when the tag was submitted
++    int64_t t1;         // H: end us,   D: device ns
++    int64_t arg;
++};
++struct ggml_trace_state {
++    std::mutex                  mtx;
++    std::vector<ggml_trace_rec> recs;
++    FILE *                      f        = nullptr;
++    void (*resolver)(void)              = nullptr;
++    bool                        on       = false;
++    size_t                      cap      = 1u << 20;
++};
++ggml_trace_state & ggml_trace_st() {
++    static ggml_trace_state st;
++    return st;
++}
++void ggml_trace_write_locked(ggml_trace_state & st) {
++    if (!st.f) {
++        return;
++    }
++    for (const auto & r : st.recs) {
++        fprintf(st.f, "%c %s %lld %lld %lld\n", r.kind, r.name, (long long) r.t0, (long long) r.t1, (long long) r.arg);
++    }
++    fflush(st.f);
++    st.recs.clear();
++}
++void ggml_trace_push(char kind, const char * name, int64_t t0, int64_t t1, int64_t arg) {
++    auto & st = ggml_trace_st();
++    std::lock_guard<std::mutex> lk(st.mtx);
++    ggml_trace_rec r;
++    r.kind = kind;
++    size_t i = 0;
++    for (; name && name[i] && i < sizeof(r.name) - 1; ++i) {
++        r.name[i] = (name[i] == ' ' || name[i] == '\n') ? '_' : name[i];
++    }
++    r.name[i] = 0;
++    r.t0 = t0; r.t1 = t1; r.arg = arg;
++    st.recs.push_back(r);
++    if (st.recs.size() >= st.cap) {
++        ggml_trace_write_locked(st);
++    }
++}
++void ggml_trace_atexit() {
++    ggml_trace_flush();
++}
++} // namespace
++
++bool ggml_trace_on(void) {
++    static const bool on = [] {
++        const char * e = getenv("GGML_TRACE");
++        if (!e || !*e || strcmp(e, "0") == 0) {
++            return false;
++        }
++        auto & st = ggml_trace_st();
++        st.f = fopen(e, "a");
++        if (!st.f) {
++            GGML_LOG_WARN("GGML_TRACE: cannot open %s, tracing off\n", e);
++            return false;
++        }
++        st.recs.reserve(st.cap);
++        st.on = true;
++        GGML_LOG_INFO("GGML_TRACE: timeline trace -> %s\n", e);
++        atexit(ggml_trace_atexit);
++        return true;
++    }();
++    return on;
++}
++
++void ggml_trace_host(const char * name, int64_t t0_us, int64_t t1_us, int64_t arg) {
++    if (ggml_trace_on()) {
++        ggml_trace_push('H', name, t0_us, t1_us, arg);
++    }
++}
++
++void ggml_trace_dev(const char * name, int64_t t_host_us, int64_t dev_ns, int64_t arg) {
++    if (ggml_trace_on()) {
++        ggml_trace_push('D', name, t_host_us, dev_ns, arg);
++    }
++}
++
++void ggml_trace_set_resolver(void (*fn)(void)) {
++    auto & st = ggml_trace_st();
++    std::lock_guard<std::mutex> lk(st.mtx);
++    st.resolver = fn;
++}
++
++void ggml_trace_flush(void) {
++    if (!ggml_trace_on()) {
++        return;
++    }
++    auto & st = ggml_trace_st();
++    void (*fn)(void) = nullptr;
++    {
++        std::lock_guard<std::mutex> lk(st.mtx);
++        fn = st.resolver;
++    }
++    if (fn) {
++        fn(); // pushes 'D' records (takes the lock itself)
++    }
++    std::lock_guard<std::mutex> lk(st.mtx);
++    ggml_trace_write_locked(st);
++}
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 692e46c40f..8d9a057e1b 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -35,6 +35,9 @@
+ #include <chrono>
+ #include <map>
+ #include <mutex>
++#include <condition_variable>
++#include <deque>
++#include <thread>
+ #include <set>
+ #include <tuple>
+ #include <cstring>
+@@ -43,6 +46,7 @@
+ #include <unistd.h>
+ #include <sycl/sycl.hpp>
+ #include <sycl/backend.hpp>
++#include <sycl/ext/oneapi/experimental/profiling_tag.hpp> // [decodeidle] GGML_TRACE device tags
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+ #include <level_zero/ze_api.h>
+ #include <level_zero/zes_api.h>
+@@ -729,10 +733,25 @@ catch (sycl::exception const &exc) {
+   GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
++// [decodeidle] GGML_TRACE: host interval of a blocking buffer copy
++struct ggml_sycl_trace_host_scope {
++    const char * name; int64_t arg; int64_t t0;
++    ggml_sycl_trace_host_scope(const char * n, int64_t a) : name(n), arg(a), t0(ggml_trace_on() ? ggml_time_us() : 0) {}
++    ~ggml_sycl_trace_host_scope() { if (t0) ggml_trace_host(name, t0, ggml_time_us(), arg); }
++};
++static inline void ggml_sycl_trace_tag(sycl::queue & q, const char * name, int64_t arg);
++
+ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+                                                 ggml_tensor *tensor,
+                                                 const void *data, size_t offset,
+                                                 size_t size) try {
++    ggml_sycl_trace_host_scope tr_scope("sycl.bset", (int64_t) size); // [decodeidle]
++    if (ggml_trace_on() && getenv("GGML_TRACE_BSET_NAMES")) {
++        static std::set<std::string> seen;
++        if (seen.insert(tensor->name).second) {
++            GGML_LOG_INFO("[trace] blocking set_tensor: '%s' %zu bytes (op %s)\n", tensor->name, size, ggml_op_name(tensor->op));
++        }
++    }
+     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
+     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
+     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+@@ -774,6 +793,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+                                                 const ggml_tensor *tensor,
+                                                 void *data, size_t offset,
+                                                 size_t size) try {
++    ggml_sycl_trace_host_scope tr_scope("sycl.bget", (int64_t) size); // [decodeidle]
+     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
+     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
+     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+@@ -6107,6 +6127,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+     SYCL_CHECK(CHECK_TRY_ERROR(
+         (stream)->memcpy((char *)tensor->data + offset, data, size)));
++    ggml_sycl_trace_tag(*stream, "h2d", (int64_t) size); // [decodeidle]
+ }
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+@@ -6128,6 +6149,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
+     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+     SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
+         data, (const char *)tensor->data + offset, size)));
++    ggml_sycl_trace_tag(*stream, "d2h", (int64_t) size); // [decodeidle]
+ }
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+@@ -6169,7 +6191,11 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
+     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
+     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
++    const int64_t tr_t0 = ggml_trace_on() ? ggml_time_us() : 0; // [decodeidle]
+     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
++    if (tr_t0) {
++        ggml_trace_host("sycl.sync", tr_t0, ggml_time_us(), 0);
++    }
+ 
+     GGML_UNUSED(backend);
+ }
+@@ -7177,7 +7203,179 @@ static int ggml_sycl_tl_mode() {
+     return every;
+ }
+ 
++// ---- LOCAL (decodeidle) GGML_TRACE=<file> (default off): device timestamps for the ggml timeline trace (ggml-backend.h).
++//      A profiling tag (sycl_ext_oneapi_profiling_tag: a device timestamp written when all earlier work of the in-order
++//      queue is done, no host round trip, no wait) is submitted before and after each graph and after each async copy;
++//      the host submission time is recorded with it. Tags are resolved (device ns read back) only at ggml_trace_flush(),
++//      followed by idle-queue calibration tags that map the device clock onto ggml_time_us(). Host intervals: graph
++//      submission (g.submit), backend synchronize (sycl.sync), blocking buffer copies (sycl.bset / sycl.bget).
++//      Cost when on: ~2 tag submissions per graph; when off: one static bool test.
++static int g_sycl_trace_last_mode = -1; // set by the graph cache: 0 eager, 1 replay, 2 record+replay
++struct ggml_sycl_trace_tag_t { sycl::event ev; int64_t t_host; const char * name; int64_t arg; };
++static std::vector<ggml_sycl_trace_tag_t> g_sycl_trace_tags;
++static sycl::queue * g_sycl_trace_q = nullptr;
++static std::mutex g_sycl_trace_mtx;
++
++static void ggml_sycl_trace_resolve() {
++    std::lock_guard<std::mutex> lk(g_sycl_trace_mtx);
++    for (auto & tg : g_sycl_trace_tags) {
++        try {
++            tg.ev.wait();
++            const uint64_t ns = tg.ev.get_profiling_info<sycl::info::event_profiling::command_end>();
++            ggml_trace_dev(tg.name, tg.t_host, (int64_t) ns, tg.arg);
++        } catch (std::exception const & e) {
++            ggml_trace_dev("tag_error", tg.t_host, 0, tg.arg);
++        }
++    }
++    g_sycl_trace_tags.clear();
++    if (g_sycl_trace_q) {
++        // clock calibration on an idle queue: device ns of a tag vs host us around its submission (arg = window us)
++        for (int k = 0; k < 16; ++k) {
++            g_sycl_trace_q->wait();
++            const int64_t t0 = ggml_time_us();
++            sycl::event ev = sycl_ex::submit_profiling_tag(*g_sycl_trace_q);
++            ev.wait();
++            const int64_t t1 = ggml_time_us();
++            const uint64_t ns = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
++            ggml_trace_dev("calib", t0, (int64_t) ns, t1 - t0);
++        }
++    }
++}
++
++// GGML_TRACE_DEV=1 (default with GGML_TRACE): no extra device commands. The event of the last command in the in-order
++// queue (sycl_ext_oneapi_in_order_queue_events get_last_event) is handed to a poller thread, which spins on the head
++// event's status and records its completion time on the host clock (resolution ~ a few us). Records "dev.<name>" host
++// intervals [submission time, completion time]. =2: profiling tags (see above; they cost ~0.3 ms host per tag on the
++// B70, so they distort the timeline). 0: no device records.
++struct ggml_sycl_trace_poll_item { sycl::event ev; int64_t t_host; const char * name; int64_t arg; };
++static std::mutex                             g_sycl_tpoll_mtx;
++static std::condition_variable                g_sycl_tpoll_cv;
++static std::deque<ggml_sycl_trace_poll_item>  g_sycl_tpoll_q;
++static std::atomic<bool>                      g_sycl_tpoll_stop{ false };
++static std::thread                            g_sycl_tpoll_thread;
++static void ggml_sycl_trace_poller() {
++    char nm[48];
++    while (true) {
++        ggml_sycl_trace_poll_item it;
++        {
++            std::unique_lock<std::mutex> lk(g_sycl_tpoll_mtx);
++            g_sycl_tpoll_cv.wait(lk, [] { return !g_sycl_tpoll_q.empty() || g_sycl_tpoll_stop.load(); });
++            if (g_sycl_tpoll_q.empty()) {
++                return;
++            }
++            it = g_sycl_tpoll_q.front();
++            g_sycl_tpoll_q.pop_front();
++        }
++        int64_t t_done = 0;
++        try {
++            while (!g_sycl_tpoll_stop.load(std::memory_order_relaxed) &&
++                   it.ev.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete) {
++                for (int k = 0; k < 64; ++k) {
++#if defined(__x86_64__) || defined(_M_X64)
++                    __builtin_ia32_pause();
++#endif
++                }
++            }
++            t_done = g_sycl_tpoll_stop.load() ? -1 : ggml_time_us();
++        } catch (...) {
++            t_done = -1;
++        }
++        snprintf(nm, sizeof(nm), "dev.%s", it.name);
++        ggml_trace_host(nm, it.t_host, t_done, it.arg);
++    }
++}
++static int ggml_sycl_trace_dev_mode() {
++    static const int m = getenv("GGML_TRACE_DEV") ? atoi(getenv("GGML_TRACE_DEV")) : 1;
++    return m;
++}
++
++static bool ggml_sycl_trace_ok(sycl::queue & q) {
++    static int ok = -1;
++    if (ok < 0) {
++        ok = 0;
++        if (ggml_trace_on()) {
++            if (ggml_sycl_trace_dev_mode() == 1) {
++                ok = 1;
++                g_sycl_tpoll_thread = std::thread(ggml_sycl_trace_poller);
++                std::atexit([] {
++                    g_sycl_tpoll_stop = true;
++                    g_sycl_tpoll_cv.notify_all();
++                    if (g_sycl_tpoll_thread.joinable()) {
++                        g_sycl_tpoll_thread.join();
++                    }
++                    std::lock_guard<std::mutex> lk(g_sycl_tpoll_mtx);
++                    g_sycl_tpoll_q.clear();
++                });
++            } else if (ggml_sycl_trace_dev_mode() == 2) {
++                if (q.get_device().has(sycl::aspect::ext_oneapi_queue_profiling_tag)) {
++                    ok = 1;
++                    ggml_trace_set_resolver(ggml_sycl_trace_resolve);
++                } else {
++                    GGML_LOG_WARN("GGML_TRACE: device lacks ext_oneapi_queue_profiling_tag, no device timestamps\n");
++                }
++            }
++        }
++    }
++    return ok == 1;
++}
++
++static inline void ggml_sycl_trace_tag(sycl::queue & q, const char * name, int64_t arg) {
++    if (!ggml_sycl_trace_ok(q) || g_ggml_sycl_graph_recording) {
++        return;
++    }
++    // GGML_TRACE_TAGS bitmask (default 15): 1 g.pre, 2 g.post, 4 h2d, 8 d2h
++    static const int mask = getenv("GGML_TRACE_TAGS") ? atoi(getenv("GGML_TRACE_TAGS")) : 15;
++    const int bit = name[0] == 'g' ? (name[2] == 'p' && name[3] == 'r' ? 1 : 2) : (name[0] == 'h' ? 4 : 8);
++    if (!(mask & bit)) {
++        return;
++    }
++    const int64_t t = ggml_time_us();
++    if (ggml_sycl_trace_dev_mode() == 1) {
++        if (bit == 1) {
++            return; // the poller derives starts from completions + submission times
++        }
++        std::optional<sycl::event> ev = q.ext_oneapi_get_last_event();
++        if (!ev) {
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lk(g_sycl_tpoll_mtx);
++            g_sycl_tpoll_q.push_back({ *ev, t, name, arg });
++        }
++        g_sycl_tpoll_cv.notify_one();
++        return;
++    }
++    sycl::event ev = sycl_ex::submit_profiling_tag(q);
++    std::lock_guard<std::mutex> lk(g_sycl_trace_mtx);
++    g_sycl_trace_tags.push_back({ ev, t, name, arg });
++    g_sycl_trace_q = &q;
++}
++
++static ggml_status ggml_backend_sycl_graph_compute_traced(ggml_backend_t backend, ggml_cgraph * cgraph);
++
+ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
++    auto * sycl_ctx0 = static_cast<ggml_backend_sycl_context *>(backend->context);
++    if (!ggml_sycl_trace_ok(*sycl_ctx0->stream())) {
++        return ggml_backend_sycl_graph_compute_traced(backend, cgraph);
++    }
++    int64_t n_tokens = 0;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) { n_tokens = cgraph->nodes[i]->ne[1]; break; }
++    }
++    int64_t arg = (int64_t) cgraph->n_nodes | (n_tokens << 20);
++    sycl::queue & q = *sycl_ctx0->stream();
++    ggml_sycl_trace_tag(q, "g.pre", arg);
++    g_sycl_trace_last_mode = -1;
++    const int64_t t0 = ggml_time_us();
++    const ggml_status st = ggml_backend_sycl_graph_compute_traced(backend, cgraph);
++    const int64_t t1 = ggml_time_us();
++    arg |= (int64_t) (g_sycl_trace_last_mode + 1) << 40;
++    ggml_trace_host("g.submit", t0, t1, arg);
++    ggml_sycl_trace_tag(q, "g.post", arg);
++    return st;
++}
++
++static ggml_status ggml_backend_sycl_graph_compute_traced(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     const int tl_every = ggml_sycl_tl_mode();
+     if (tl_every > 0 && !g_ggml_sycl_graph_recording) {
+         int64_t n_tokens = 0;
+@@ -7718,6 +7916,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
+             }
+             g_gstat_too_big_reason[why]++;
+         }
++        g_sycl_trace_last_mode = 0;
+         ggml_backend_sycl_graph_compute_impl(ctx, cgraph);
+         return;
+     }
+@@ -7786,6 +7985,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
+ 
+     if (e.exec) {
+         g_gstat_replay++;
++        g_sycl_trace_last_mode = 1;
+         ggml_sycl_gstat_timer tp(cfg.stats > 0 ? &g_gstat_t_replay_us : nullptr);
+         ctx->stream()->ext_oneapi_graph(*e.exec);
+         return;
+@@ -7794,6 +7994,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
+     if (e.no_graph || e.seen < cfg.warmup) {
+         e.seen++;
+         g_gstat_eager++;
++        g_sycl_trace_last_mode = 0;
+         {
+             ggml_sycl_gstat_timer te(cfg.stats > 0 ? &g_gstat_t_eager_us : nullptr);
+             g_gstat_n_eager_timed += cfg.stats > 0 ? 1 : 0;
+@@ -7835,6 +8036,7 @@ static void ggml_sycl_graph_compute_cached(ggml_backend_sycl_context * ctx, ggml
+         return;
+     }
+     g_gstat_record++;
++    g_sycl_trace_last_mode = 2;
+     e.exec = std::move(exec);
+     if (cfg.selftest == 2) {
+         return;  // negative control for the selftest harness: poisoned outputs are NOT recomputed -> tests must fail
+@@ -8540,7 +8742,11 @@ static void ggml_backend_sycl_device_event_synchronize(ggml_backend_dev_t dev, g
+   GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
+ 
+   sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
++  const int64_t tr_t0 = ggml_trace_on() ? ggml_time_us() : 0; // [decodeidle]
+   SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
++  if (tr_t0) {
++      ggml_trace_host("sycl.event_sync", tr_t0, ggml_time_us(), 0);
++  }
+ } catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0f395f16df..1c7aaa9d5d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -796,10 +796,21 @@ static int llama_hprof_mode() {
+     }
+     return every;
+ }
++// [decodeidle] the phases are also recorded as host intervals of the GGML_TRACE timeline (ggml-backend.h)
++static bool llama_hprof_on() {
++    static const bool on = llama_hprof_mode() > 0 || ggml_trace_on();
++    return on;
++}
+ static void llama_hprof_add(const std::string & key, int64_t t0_us) {
+-    auto & a = g_llama_hprof[key];
+-    a.n++;
+-    a.ms += (ggml_time_us() - t0_us) / 1000.0;
++    const int64_t t1_us = ggml_time_us();
++    if (llama_hprof_mode() > 0) {
++        auto & a = g_llama_hprof[key];
++        a.n++;
++        a.ms += (t1_us - t0_us) / 1000.0;
++    }
++    if (ggml_trace_on()) {
++        ggml_trace_host(key.c_str(), t0_us, t1_us, 0);
++    }
+ }
+ 
+ // [hostv] env LLAMA_SYNC_SKIP_IDLE=1 (default 0): llama_synchronize() on a context that has submitted no graph since its
+@@ -826,7 +837,7 @@ void llama_context::synchronize() {
+     sched_pending = false;
+ 
+     {
+-        const int64_t t0 = llama_hprof_mode() > 0 ? ggml_time_us() : 0;
++        const int64_t t0 = llama_hprof_on() ? ggml_time_us() : 0;
+         ggml_backend_sched_synchronize(sched.get());
+         if (t0 && n_queued_tokens > 0) {
+             llama_hprof_add(std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + ".sync_wait", t0);
+@@ -1024,6 +1035,27 @@ float * llama_context::get_logits_ith(int32_t i) {
+     }
+ }
+ 
++float * llama_context::get_logits_ith_fetch(int32_t i) {
++    output_reorder();
++    if (logits.data == nullptr || fetch_t_logits == nullptr || !fetch_sorted) {
++        return nullptr;
++    }
++    int64_t j;
++    try {
++        j = output_resolve_row(i);
++    } catch (const std::exception &) {
++        return nullptr;
++    }
++    if (j < fetch_row0 || j >= fetch_row0 + fetch_n || fetch_t_logits->ne[0] != (int64_t) model.vocab.n_tokens()) {
++        return nullptr;
++    }
++    synchronize();
++    const int64_t n_vocab = model.vocab.n_tokens();
++    ggml_backend_tensor_get(fetch_t_logits, logits.data + j*n_vocab, (size_t) (j - fetch_row0)*fetch_t_logits->nb[1],
++                            (size_t) n_vocab*sizeof(float));
++    return logits.data + j*n_vocab;
++}
++
+ float * llama_context::get_embeddings() {
+     output_reorder();
+ 
+@@ -1522,8 +1554,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         return nullptr;
+     }
+ 
+-    const bool hprof = llama_hprof_mode() > 0;
+-    const std::string hp_tag = std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + ".n" + std::to_string(ubatch.n_tokens);
++    const bool hprof = llama_hprof_on();
++    const std::string hp_tag = hprof ? std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + ".n" + std::to_string(ubatch.n_tokens) : std::string();
+     int64_t hp_t0 = hprof ? ggml_time_us() : 0;
+     bool hp_reused = false;
+ 
+@@ -1979,7 +2011,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     }
+ 
+     // [spechost] LLAMA_HOST_PROF: host time of the batch/memory preparation before the first ubatch
+-    const bool    hp_dec   = llama_hprof_mode() > 0;
++    const bool    hp_dec   = llama_hprof_on();
+     const int64_t hp_dec_t = hp_dec ? ggml_time_us() : 0;
+     const std::string hp_dec_tag = hp_dec ? std::string(cparams.embeddings_nextn_masked ? "dft" : "tgt") + (batch_inp.n_tokens <= 16 ? "" : ".pp") : std::string();
+ 
+@@ -2160,6 +2192,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+         auto * t_logits  = res->get_logits();
+         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
++        // [decodeidle] remember where this ubatch's logits live on the device (llama_get_logits_ith_fetch)
++        fetch_t_logits = (t_logits && n_outputs > 0) ? t_logits : nullptr;
++        fetch_row0     = n_outputs_prev;
++        fetch_n        = n_outputs;
+         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+         const int64_t hp_ex_t0 = hp_dec ? ggml_time_us() : 0; // [draftcost] output extraction enqueue
+ 
+@@ -2302,6 +2338,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     n_outputs = n_outputs_all;
+ 
+     // set output mappings
++    fetch_sorted = false;
+     if (n_outputs > 0) {
+         bool sorted_output = true;
+ 
+@@ -2317,6 +2354,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             }
+         }
+ 
++        fetch_sorted = sorted_output || n_outputs == 1;
++
+         // make the outputs have the same order they had in the user-provided batch
+         // note: this is mostly relevant for recurrent models atm
+         if (!sorted_output && n_outputs > 1) {
+@@ -4322,6 +4361,11 @@ float * llama_get_logits(llama_context * ctx) {
+     return ctx->get_logits();
+ }
+ 
++float * llama_get_logits_ith_fetch(llama_context * ctx, int32_t i) {
++    ctx->synchronize();
++    return ctx->get_logits_ith_fetch(i);
++}
++
+ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+     ctx->synchronize();
+ 
+@@ -4739,11 +4783,11 @@ int32_t llama_encode(
+ 
+ // exported hook so common/ and tools/ can record phases into the same LLAMA_HOST_PROF table
+ bool llama_hprof_enabled(void) {
+-    return llama_hprof_mode() > 0;
++    return llama_hprof_on();
+ }
+ 
+ void llama_hprof_record(const char * key, int64_t t0_us) {
+-    if (llama_hprof_mode() > 0) {
++    if (llama_hprof_on()) {
+         llama_hprof_add(key, t0_us);
+     }
+ }
+@@ -4763,10 +4807,12 @@ int32_t llama_decode(
+         }
+         if (batch.n_tokens <= 16) have_small = true;
+     }
+-    const int64_t hp_t0 = hp_every > 0 ? ggml_time_us() : 0;
++    const int64_t hp_t0 = llama_hprof_on() ? ggml_time_us() : 0;
+     const int ret = ctx->decode(batch);
+-    if (hp_every > 0) {
++    if (hp_t0) {
+         llama_hprof_add(std::string(ctx->get_cparams().embeddings_nextn_masked ? "dft" : "tgt") + ".llama_decode_call", hp_t0);
++    }
++    if (hp_every > 0) {
+         if (++g_llama_hprof_decodes % hp_every == 0) {
+             llama_hprof_print();
+         }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 44abbea1fe..2f70822933 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -81,6 +81,12 @@ struct llama_context {
+ 
+     float * get_logits();
+     float * get_logits_ith(int32_t i);
++    // [decodeidle] LLAMA_TGT_TOPK_DEVICE: read output row i of the last decode's logits from the device (blocking)
++    float * get_logits_ith_fetch(int32_t i);
++    ggml_tensor *  fetch_t_logits  = nullptr; // logits tensor of the last ubatch of the last decode
++    int64_t        fetch_row0      = 0;       // its first output row
++    int64_t        fetch_n         = 0;
++    bool           fetch_sorted    = false;   // outputs were not reordered
+ 
+     float * get_embeddings();
+     float * get_embeddings_ith(int32_t i);
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 3bae2fd21d..f602a3d11d 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -16,6 +16,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
+         uint32_t n_seqs,
+         uint32_t n_outputs);
+ 
++// [decodeidle] LLAMA_TGT_TOPK_DEVICE: output row i of the last decode's raw logits, read from the device now (blocking).
++// Valid only until the next decode on ctx; nullptr if the row cannot be fetched (e.g. reordered outputs).
++LLAMA_API float * llama_get_logits_ith_fetch(struct llama_context * ctx, int32_t i);
++
+ // Get the default ggml_type for a given ftype.
+ LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index b56d2f8fe5..ae14fbfcea 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -362,10 +362,57 @@ llama_kv_cache::llama_kv_cache(
+         }
+     }
+ 
++    // [decodeidle] LLAMA_KV_ROT_DEVICE=1 (default 0): device copies of the rotation matrices (same values, uploaded once)
++    {
++        const char * e = getenv("LLAMA_KV_ROT_DEVICE");
++        if (e && atoi(e) != 0 && (attn_rot_k || attn_rot_v) && !hparams.no_alloc && ctxs_bufs.size() == 1) {
++            ggml_init_params params = {
++                /* .mem_size   = */ 2*ggml_tensor_overhead(),
++                /* .mem_buffer = */ nullptr,
++                /* .no_alloc   = */ true,
++            };
++            rot_dev_ctx.reset(ggml_init(params));
++            const int nk = attn_rot_k ? rot_nrot_k() : 0;
++            const int nv = attn_rot_v ? 64 : 0;
++            if (nk) {
++                rot_dev_k = ggml_new_tensor_2d(rot_dev_ctx.get(), GGML_TYPE_F32, nk, nk);
++                ggml_set_name(rot_dev_k, "attn_k_rot_dev");
++            }
++            if (nv) {
++                rot_dev_v = ggml_new_tensor_2d(rot_dev_ctx.get(), GGML_TYPE_F32, nv, nv);
++                ggml_set_name(rot_dev_v, "attn_v_rot_dev");
++            }
++            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(ctxs_bufs[0].second.get());
++            rot_dev_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(rot_dev_ctx.get(), buft));
++            if (rot_dev_buf && (!rot_dev_k || attn_rot_hadamard.count(nk)) && (!rot_dev_v || attn_rot_hadamard.count(nv))) {
++                if (rot_dev_k) {
++                    ggml_backend_tensor_set(rot_dev_k, attn_rot_hadamard.at(nk).data(), 0, ggml_nbytes(rot_dev_k));
++                }
++                if (rot_dev_v) {
++                    ggml_backend_tensor_set(rot_dev_v, attn_rot_hadamard.at(nv).data(), 0, ggml_nbytes(rot_dev_v));
++                }
++                LLAMA_LOG_INFO("%s: LLAMA_KV_ROT_DEVICE: rotation matrices on %s (k %d, v %d)\n", __func__,
++                               ggml_backend_buffer_name(rot_dev_buf.get()), nk, nv);
++            } else {
++                rot_dev_k = rot_dev_v = nullptr;
++                rot_dev_buf.reset();
++                rot_dev_ctx.reset();
++            }
++        }
++    }
++
+     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
+     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+ }
+ 
++int llama_kv_cache::rot_nrot_k() const {
++    int nrot = 64;
++    do {
++        nrot *= 2;
++    } while (n_embd_head_k_all % nrot == 0);
++    return nrot / 2;
++}
++
+ void llama_kv_cache::clear(bool data) {
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         v_cells[s].reset();
+@@ -1463,6 +1510,10 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
+ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+     ggml_tensor * res = nullptr;
+ 
++    if (attn_rot_k && rot_dev_k) {
++        return rot_dev_k; // [decodeidle] LLAMA_KV_ROT_DEVICE
++    }
++
+     if (attn_rot_k) {
+         int nrot = 64;
+ 
+@@ -1484,6 +1535,10 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
+     ggml_tensor * res = nullptr;
+ 
++    if (attn_rot_v && rot_dev_v) {
++        return rot_dev_v; // [decodeidle] LLAMA_KV_ROT_DEVICE
++    }
++
+     if (attn_rot_v) {
+         int nrot = 64;
+         // using smaller rotation matrices for V seems beneficial
+@@ -2054,6 +2109,9 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+ }
+ 
+ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
++    if (dst == rot_dev_k) {
++        return; // [decodeidle] LLAMA_KV_ROT_DEVICE: filled once at init
++    }
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const auto n_rot = dst->ne[0];
+@@ -2063,6 +2121,9 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+ }
+ 
+ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
++    if (dst == rot_dev_v) {
++        return; // [decodeidle] LLAMA_KV_ROT_DEVICE: filled once at init
++    }
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+     const auto n_rot = dst->ne[0];
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 1b5dbef2f4..8c84b0fdfd 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -289,6 +289,14 @@ private:
+     // pre-computed hadamard martrices
+     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+ 
++    // [decodeidle] LLAMA_KV_ROT_DEVICE=1: the K / V rotation matrices live in a device buffer of their own (filled once)
++    // instead of being graph inputs that are copied to the device before every graph
++    ggml_context_ptr        rot_dev_ctx;
++    ggml_backend_buffer_ptr rot_dev_buf;
++    ggml_tensor *           rot_dev_k = nullptr;
++    ggml_tensor *           rot_dev_v = nullptr;
++    int                     rot_nrot_k() const;
++
+     // env: LLAMA_KV_CACHE_DEBUG
+     int debug = 0;
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index c4b7116745..f99428f9f1 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -419,6 +419,12 @@ struct server_slot {
+ 
+     common_sampler_ptr smpl;
+ 
++    // [decodeidle] LLAMA_TGT_TOPK_DEVICE: backend chain {top_k(k+1)} attached to ctx_tgt for this slot's seq (kept
++    // across requests; attaching / detaching re-reserves the scheduler)
++    llama_sampler * tgt_topk_chain = nullptr;
++    int32_t         tgt_topk_k     = 0;     // k of tgt_topk_chain
++    bool            tgt_topk_set   = false; // tgt_topk_chain is the sampler of this seq on ctx_tgt
++
+     llama_token sampled; // in speculative mode, this is the last accepted token
+ 
+     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
+@@ -469,7 +475,11 @@ struct server_slot {
+ 
+         n_predict_max = -1;
+ 
+-        llama_set_sampler(ctx_tgt, id, nullptr);
++        // [decodeidle] LLAMA_TGT_TOPK_DEVICE: keep the top-k chain attached across requests (attaching / detaching
++        // re-reserves the scheduler); the next launch detaches it if that request cannot use it
++        if (!tgt_topk_set) {
++            llama_set_sampler(ctx_tgt, id, nullptr);
++        }
+ 
+         // clear alora start
+         alora_invocation_start = -1;
+@@ -1923,10 +1933,45 @@ private:
+             // TODO: getting pre sampling logits is not yet supported with backend sampling
+             use_backend_sampling &= !need_pre_sample_logits;
+ 
++            // [decodeidle] LLAMA_TGT_TOPK_DEVICE=1 (default 0): when the CPU chain starts with top-k (everything before it a
++            // no-op, see common_sampler_chain_top_k), the target computes the top k+1 logits of each output row on the
++            // device and only those are copied to the host instead of the whole vocab row (~1 MB per row). The CPU chain
++            // then runs on them; a row whose k+1 values are not all distinct is re-read in full (exact, see sampling.cpp)
++            static const bool tgt_topk_env = [] {
++                const char * e = getenv("LLAMA_TGT_TOPK_DEVICE");
++                return e && atoi(e) != 0;
++            }();
++            const int32_t tgt_topk_k = (tgt_topk_env && !use_backend_sampling && task.params.sampling.n_probs == 0)
++                ? common_sampler_chain_top_k(slot.smpl.get()) : 0;
++
+             // TODO: tmp until backend sampling is fully implemented
+             if (use_backend_sampling) {
++                slot.tgt_topk_set = false;
+                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
++            } else if (tgt_topk_k > 0 && tgt_topk_k < 1024) {
++                if (slot.tgt_topk_chain == nullptr || slot.tgt_topk_k != tgt_topk_k) {
++                    llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
++                    llama_sampler_chain_add(chain, llama_sampler_init_top_k(tgt_topk_k + 1));
++                    if (slot.tgt_topk_set) {
++                        llama_set_sampler(ctx_tgt, slot.id, nullptr);
++                        slot.tgt_topk_set = false;
++                    }
++                    if (slot.tgt_topk_chain) {
++                        llama_sampler_free(slot.tgt_topk_chain);
++                    }
++                    slot.tgt_topk_chain = chain;
++                    slot.tgt_topk_k     = tgt_topk_k;
++                }
++                if (!slot.tgt_topk_set) {
++                    slot.tgt_topk_set = llama_set_sampler(ctx_tgt, slot.id, slot.tgt_topk_chain);
++                    SLT_INF(slot, "LLAMA_TGT_TOPK_DEVICE: target top-%d candidates on the device: %s\n", tgt_topk_k + 1,
++                            slot.tgt_topk_set ? "on" : "FAILED (full logits)");
++                }
++                if (slot.tgt_topk_set) {
++                    common_sampler_set_tgt_topk_device(slot.smpl.get(), tgt_topk_k);
++                }
+             } else {
++                slot.tgt_topk_set = false;
+                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+             }
+ 
+@@ -2964,6 +3009,10 @@ private:
+ 
+                 metrics_flush_idle();
+ 
++                if (ggml_trace_on()) {
++                    ggml_trace_flush(); // [decodeidle] GGML_TRACE: resolve device tags + write the trace while idle
++                }
++
+                 return; // skip further processing
+ 
+             } else {
+@@ -4172,6 +4221,12 @@ private:
+ 
+                 GGML_ASSERT(accepted.size() >= 1);
+ 
++                if (ggml_trace_on()) { // [decodeidle] GGML_TRACE: drafted | accepted << 8 | position << 16
++                    const int64_t tr_t = ggml_time_us();
++                    ggml_trace_host("srv.spec_result", tr_t, tr_t, (int64_t) n_draft | ((int64_t) (accepted.size() - 1) << 8) |
++                                    ((int64_t) slot.prompt.n_tokens() << 16));
++                }
++
+                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+ 
+                 const bool use_ckpt_tgt =

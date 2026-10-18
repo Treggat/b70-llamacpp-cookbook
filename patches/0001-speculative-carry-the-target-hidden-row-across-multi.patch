@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Fri, 4 Sep 2026 20:08:16 -0600
+Subject: [PATCH 01/27] speculative : carry the target hidden row across
+ multimodal chunks for draft-mtp
+
+Assisted-by: Claude Fable 5.1
+---
+ common/speculative.cpp | 35 +++++++++++++++++++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 77dfe9535f..1e5c8e3c72 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1481,13 +1481,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+     }
+ 
++    // media ubatch: the drafter cannot decode it, carry the target's last h_nextn row per seq
++    // so the first text token after the media pairs with the right h
++    void process_media_batch(const llama_batch & batch_in) {
++        auto * ctx_tgt = this->params.ctx_tgt;
++
++        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++
++        std::vector<int32_t> last_row(n_seq, -1);
++        for (int k = 0; k < batch_in.n_tokens; ++k) {
++            const llama_seq_id seq_id = batch_in.seq_id[k][0];
++            if (seq_id >= 0 && (uint32_t) seq_id < n_seq) {
++                last_row[seq_id] = k;
++            }
++        }
++
++        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            if (last_row[seq_id] < 0) {
++                continue;
++            }
++            const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, last_row[seq_id]);
++            std::memcpy(pending_h[seq_id].data(), h, row_bytes);
++        }
++    }
++
+     bool process(const llama_batch & batch_in) override {
+         if (batch_in.n_tokens <= 0) {
+             return true;
+         }
+ 
+-        // TODO: how to make it work with vision tokens?
+-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
++        if (batch_in.token == nullptr && batch_in.embd == nullptr) {
++            return true;
++        }
++
++        // media chunk: keep pending_h in sync, the draft memory simply skips the media positions
++        if (batch_in.embd != nullptr) {
++            if (!is_mem_shared) {
++                process_media_batch(batch_in);
++            }
+             return true;
+         }
+ 

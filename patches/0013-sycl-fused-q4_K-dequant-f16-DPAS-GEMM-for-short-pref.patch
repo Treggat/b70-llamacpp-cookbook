@@ -1,0 +1,1060 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Sat, 26 Sep 2026 19:34:40 -0600
+Subject: [PATCH 13/27] sycl : fused q4_K dequant + f16 DPAS GEMM for short
+ prefill ubatches
+
+Runtime switch GGML_SYCL_DQ_GEMM (default off). q4_K x f32 MUL_MAT with
+33..1536 columns runs a fused kernel that dequantizes weights into SLM and
+feeds f16 joint_matrix with f32 accumulation, skipping the separate
+full-matrix dequant pass; larger batches keep dequant + oneDNN with a
+vectorised f32->f16 activation conversion. Tunables: _MIN_COLS (33),
+_MAX_COLS, _FUSED_MAX_COLS (1536), _IMPL=ref, _PAD, _TILE, _FASTCVT, _Q6K.
+GGML_SYCL_OP_PROFILE gains per-call averages and sub-phase rows. Adds
+prefill eval/perf cases (MUL_MAT_PREFILL) to test-backend-ops.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-sycl/CMakeLists.txt             |   6 +
+ .../src/ggml-sycl/dq-gemm-kernel/INTERFACE.md |  24 ++
+ .../ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.cpp  | 334 ++++++++++++++++++
+ .../ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.hpp  |  24 ++
+ ggml/src/ggml-sycl/dq-gemm.cpp                | 244 +++++++++++++
+ ggml/src/ggml-sycl/dq-gemm.hpp                |  86 +++++
+ ggml/src/ggml-sycl/ggml-sycl.cpp              |  45 ++-
+ tests/test-backend-ops.cpp                    |  89 ++++-
+ 8 files changed, 849 insertions(+), 3 deletions(-)
+ create mode 100644 ggml/src/ggml-sycl/dq-gemm-kernel/INTERFACE.md
+ create mode 100644 ggml/src/ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.cpp
+ create mode 100644 ggml/src/ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.hpp
+ create mode 100644 ggml/src/ggml-sycl/dq-gemm.cpp
+ create mode 100644 ggml/src/ggml-sycl/dq-gemm.hpp
+
+diff --git a/ggml/src/ggml-sycl/CMakeLists.txt b/ggml/src/ggml-sycl/CMakeLists.txt
+index 740713db81..f5c655e712 100644
+--- a/ggml/src/ggml-sycl/CMakeLists.txt
++++ b/ggml/src/ggml-sycl/CMakeLists.txt
+@@ -170,6 +170,12 @@ target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
+ if (GGML_SYCL_XMX)
+     message(STATUS "SYCL XMX q4_K/q6_K + flash-attention paths: enabled")
+     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_XMX=1)
++    # LOCAL: the fused prefill kernel behind dq-gemm.cpp (GGML_SYCL_DQ_GEMM=1); without it dq-gemm runs its reference
++    if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/dq-gemm-kernel/dq_gemm_q4k.cpp)
++        message(STATUS "SYCL XMX dq-gemm fused q4_K prefill kernel: enabled")
++        target_sources(ggml-sycl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dq-gemm-kernel/dq_gemm_q4k.cpp)
++        target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DQ_GEMM_HAVE_FUSED=1)
++    endif()
+ else()
+     target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_XMX=0)
+ endif()
+diff --git a/ggml/src/ggml-sycl/dq-gemm-kernel/INTERFACE.md b/ggml/src/ggml-sycl/dq-gemm-kernel/INTERFACE.md
+new file mode 100644
+index 0000000000..191380e98b
+--- /dev/null
++++ b/ggml/src/ggml-sycl/dq-gemm-kernel/INTERFACE.md
+@@ -0,0 +1,24 @@
++# dq_gemm_q4k interface (for dq-gemm-integrate)
++
++Files: `dq_gemm_q4k.hpp` (declarations) + `dq_gemm_q4k.cpp` (kernel + launcher, SYCL only, no ggml includes).
++Compile `dq_gemm_q4k.cpp` as a normal SYCL source (it needs the 2026.1 toolchain/runtime: joint_matrix).
++Tunables are `DQ_*` macros at the top of the .cpp; the defaults are the best measured variant.
++
++```cpp
++bool        dq_gemm_q4k_supported(int64_t M, int64_t N, int64_t K);   // K % 256 == 0, M % 128 == 0, N >= 1
++sycl::event dq_gemm_q4k(sycl::queue & q, const void * w, const sycl::half * act, float * dst,
++                        int64_t M, int64_t N, int64_t K, int64_t ldd);
++```
++- M = weight rows (ne01), N = token columns (ne11, any N >= 1; a ragged last token tile is handled inside the same single launch),
++  K = ne00.
++- `w`: ggml-sycl q4_K REORDER layout of the whole tensor, nb = M*K/256, block i = row*(K/256)+kb:
++  qs at w+0 (nb*128 B), scales at w+nb*128 (nb*12 B), dm at w+nb*140 (nb x half2 d, dmin).
++- `act`: f16, act[n*K + k] (contiguous rows, stride K). 16-byte aligned (64-byte preferred: 2D block loads).
++- `dst`: f32, dst[n*ldd + m], overwritten. ldd >= M, ldd*4 must be a multiple of 16 bytes (2D block stores).
++- Asynchronous: submits exactly 1 kernel for any N, no waits, no allocations; returns its event.
++  Token tile = 256 (the last partial tile runs in the same launch; activation rows >= N are never read).
++- Numerics: weights dequantized exactly like ggml-sycl's dequantize_block_q4_K (f32 d*sc*q - dmin*m, fma, then
++  rounded to f16 once), f16 x f16 products with f32 accumulation over all of K.
++- Pointer type: `w` is `const void *` (the tensor data); the kernel reads 16-byte vectors of qs, dwords of scales/dm.
++
++Status: see the header of `dq_gemm_q4k.cpp` and the report; the harness `dq_gemm.cpp` includes the .cpp directly.
+diff --git a/ggml/src/ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.cpp b/ggml/src/ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.cpp
+new file mode 100644
+index 0000000000..f47cd0003c
+--- /dev/null
++++ b/ggml/src/ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.cpp
+@@ -0,0 +1,334 @@
++// dq_gemm_q4k.cpp: see dq_gemm_q4k.hpp for the interface.
++//
++// Design (defaults; tunables are the DQ_* macros below):
++//   - Work-group tile WG_T = 256 tokens x WG_R = 128 weight rows, 16 sub-groups (8 along tokens x 2 along rows),
++//     sub-group tile 32 tokens x 64 rows = NA 4 A tiles (8 tok x 16 k) x NB 4 B tiles (16 k x 16 rows)
++//     -> 16 f32 accumulators (8x16) that stay in registers for the whole K loop (128 GRF, 256-GRF mode).
++//   - Roles: A = activations (row_major, straight from global, 2D block loads), B = dequantized weights
++//     (VNNI-packed f16 from SLM), C: lane = weight row, element i = token i; stored row_major into dst[n][m].
++//   - K is walked in stages of KC = 128 (half a q4_K block = 4 sub-blocks). Per stage the whole work-group
++//     dequantizes its 128 rows x 128 k into SLM (32 KB, double-buffered = 64 KB, ONE work-group barrier per stage).
++//     Each work-item owns PB-byte pieces of nibbles (row, PB of the 32 bytes of the 64-chunk) = PB low-nibble
++//     weights of sub-block 2c + PB high-nibble weights of sub-block 2c+1, plus its row's 12 scale bytes + d/dmin.
++//   - Per stage (default DQ_ILV=0): issue the global loads of stage s+2 into registers, dequantize stage s+1 (held
++//     in registers since the previous stage) into the other SLM buffer, then run the 4 DPAS k-steps of stage s
++//     (A 2D block loads + B SLM loads + 16 DPAS each), then one barrier. With DQ_BW=1 the 16 lanes of a sub-group
++//     are the 16 rows of a tile, so the dequantized VNNI dwords go out as sub-group block stores (2 per piece).
++//     DQ_ILV=1 spreads the dequant over the k-steps instead (measured slower).
++//   - Dequant = production numerics: w = (half) fma(d*sc, q, -(dmin*m)) in f32, rounded to f16 once.
++//   - Ragged N: ONE launch; the last token tile (N % WG_T) takes a separate code path in the same kernel whose A
++//     loads / C stores are bounds-checked only for the 8-token tiles that cross N.
++#include "dq_gemm_q4k.hpp"
++#include <sycl/ext/oneapi/matrix/matrix.hpp>
++#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
++
++#ifndef DQ_NA
++#define DQ_NA 4          // 8-token A tiles per sub-group
++#endif
++#ifndef DQ_NB
++#define DQ_NB 4          // 16-row B tiles per sub-group
++#endif
++#ifndef DQ_WGT
++#define DQ_WGT 8         // sub-groups along tokens
++#endif
++#ifndef DQ_WGR
++#define DQ_WGR 2         // sub-groups along rows
++#endif
++#ifndef DQ_KC
++#define DQ_KC 128        // k per SLM stage (multiple of 64)
++#endif
++#ifndef DQ_PB
++#define DQ_PB 16         // nibble bytes per staging piece (4, 8 or 16)
++#endif
++#ifndef DQ_GRF
++#define DQ_GRF 256
++#endif
++#ifndef DQ_ILV
++#define DQ_ILV 0         // 1: interleave the dequant of the next stage with the DPAS steps; 0: dequant before the DPAS
++#endif
++#ifndef DQ_BW
++#define DQ_BW 1          // 1: sub-group block stores of the dequantized VNNI dwords into SLM; 0: per-lane dword stores
++#endif
++#ifndef DQ_DBG
++#define DQ_DBG 0         // timing only (wrong results): 1 = no dequant math (raw nibble words to SLM), 2 = no DPAS,
++                         // 3 = no weight staging at all (DPAS on stale SLM), 4 = no A loads (A loaded once)
++#endif
++
++namespace dqg {
++namespace mx  = sycl::ext::oneapi::experimental::matrix;
++namespace imx = sycl::ext::intel::experimental::matrix;
++using sycl::access::address_space;
++using sycl::access::decorated;
++
++#ifndef DQ_TM
++#define DQ_TM 8          // tokens per A tile / accumulator (8, 16 or 32; the f16 combinations allow M <= 32)
++#endif
++constexpr int TM = DQ_TM, TN = 16, TK = 16, SG = 16;
++constexpr int NA = DQ_NA, NB = DQ_NB, WGT = DQ_WGT, WGR = DQ_WGR, KC = DQ_KC, PB = DQ_PB;
++constexpr int WG_T = WGT * NA * TM;          // tokens per work-group
++constexpr int WG_R = WGR * NB * TN;          // weight rows per work-group
++constexpr int NSG  = WGT * WGR;
++constexpr int WGI  = NSG * SG;               // work-items per work-group
++constexpr int CH   = KC / 64;                // 64-k chunks per stage
++constexpr int NH   = 32 / PB;                // pieces per row per chunk
++constexpr int NPC  = WG_R * NH * CH;         // pieces per stage
++constexpr int PPI  = NPC / WGI;              // pieces per work-item
++constexpr int PDW  = PB / 4;                 // dwords per piece
++constexpr int NU   = PPI * PDW;              // dequant units (1 dword of nibbles = 8 weights) per work-item per stage
++constexpr int KS   = KC / TK;                // DPAS k-steps per stage
++constexpr int BUF_DW = WG_R * KC / 2;        // dwords per SLM buffer ([row/16][k/2][row%16] of half2)
++constexpr int RT_DW  = KC / 2 * 16;          // dwords per 16-row tile in a buffer
++static_assert(KC % 64 == 0, "KC must be a multiple of 64");
++static_assert(PB == 4 || PB == 8 || PB == 16, "PB");
++static_assert(NPC % WGI == 0 && PPI >= 1, "pieces must divide evenly over the work-items (choose PB)");
++
++using Amat = mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::a, TM, TK, mx::layout::row_major>;
++using Bmat = mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::b, TK, TN, mx::layout::ext_intel_packed>;
++using Cmat = mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN>;
++
++class dq_kernel;
++
++struct Piece {                               // global data of one piece for one stage
++    uint32_t q[PDW];
++    uint32_t s0, s1, s2, sd;
++};
++
++// one launch: token tiles 0..nfull-1 are full (unchecked code path), tile nfull (if ntt > nfull) is the ragged tail
++static sycl::event launch(sycl::queue & q, const uint8_t * w, const sycl::half * act, float * dst,
++                          int M, int N, int K, int ldd, int nfull, int ntt) {
++    const int KB = K / 256;
++    const size_t nb = (size_t) M * KB;
++    const uint8_t *  wq  = w;
++    const uint32_t * wsc = reinterpret_cast<const uint32_t *>(w + nb * 128);   // 3 dwords per block
++    const uint32_t * wdm = reinterpret_cast<const uint32_t *>(w + nb * 140);   // 1 dword per block
++    const int RT = M / WG_R;
++    const size_t nwg = (size_t) ntt * RT;
++    const int NS = K / KC;                   // stages
++    return q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(2 * BUF_DW), h);
++        h.parallel_for<dq_kernel>(
++            sycl::nd_range<1>(sycl::range<1>(nwg * WGI), sycl::range<1>(WGI)),
++#if DQ_GRF > 0
++            sycl::ext::oneapi::experimental::properties{sycl::ext::intel::experimental::grf_size<DQ_GRF>},
++#endif
++            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
++          auto body = [&](auto tag) {
++            constexpr bool CHECKED = decltype(tag)::value;
++            sycl::sub_group sg = it.get_sub_group();
++            const int s   = sg.get_group_id()[0];
++            const int lid = it.get_local_id(0);
++            const int wg  = it.get_group(0);
++            const int tt  = wg % ntt, rt = wg / ntt;           // token tile fastest: neighbours share the weight tile in L2
++            const int st  = s % WGT, sr = s / WGT;
++            const int t0  = tt * WG_T + st * (NA * TM); // this sub-group's first token
++            const int rw0 = rt * WG_R;                         // work-group's first row
++            auto sp  = slm.get_multi_ptr<decorated::no>();
++            auto sph = sycl::address_space_cast<address_space::local_space, decorated::no>(
++                reinterpret_cast<sycl::half *>(&sp[0]));
++
++            // ---- staging geometry: piece p = lid + i*WGI -> r16 = p&15, hh = (p>>4)%NH, rt16, c
++            auto pgeo = [&](int i, int & r16, int & hh, int & rt16, int & c) {
++                const int p = lid + i * WGI;
++                r16 = p & 15; hh = (p >> 4) % NH;
++                const int rest = (p >> 4) / NH;
++                rt16 = rest % (WG_R / 16); c = rest / (WG_R / 16);
++            };
++            auto stage_load = [&](int stg, Piece (&P)[PPI]) {
++#pragma unroll
++                for (int i = 0; i < PPI; ++i) {
++                    int r16, hh, rt16, c; pgeo(i, r16, hh, rt16, c);
++                    const int row = rw0 + rt16 * 16 + r16;
++                    const int k0  = stg * KC + c * 64;
++                    const uint8_t * src = wq + (size_t) row * (K / 2) + (k0 >> 1) + hh * PB;
++                    if constexpr (PB == 16) {
++                        const sycl::uint4 v = *reinterpret_cast<const sycl::uint4 *>(src);
++                        P[i].q[0] = v.x(); P[i].q[1] = v.y(); P[i].q[2] = v.z(); P[i].q[3] = v.w();
++                    } else if constexpr (PB == 8) {
++                        const sycl::uint2 v = *reinterpret_cast<const sycl::uint2 *>(src);
++                        P[i].q[0] = v.x(); P[i].q[1] = v.y();
++                    } else {
++                        P[i].q[0] = *reinterpret_cast<const uint32_t *>(src);
++                    }
++                    const size_t bi = (size_t) row * KB + (k0 >> 8);
++                    P[i].s0 = wsc[bi * 3 + 0]; P[i].s1 = wsc[bi * 3 + 1]; P[i].s2 = wsc[bi * 3 + 2]; P[i].sd = wdm[bi];
++                }
++            };
++            // per-piece scale factors of a stage: da/ma (low nibbles, sub-block 2cb), db/mb (high nibbles, 2cb+1)
++            float fda[PPI], fma_[PPI], fdb[PPI], fmb[PPI];
++            auto stage_scales = [&](int stg, const Piece (&P)[PPI]) {
++#pragma unroll
++                for (int i = 0; i < PPI; ++i) {
++                    int r16, hh, rt16, c; pgeo(i, r16, hh, rt16, c);
++                    const int cb = ((stg * KC + c * 64) >> 6) & 3;           // 64-chunk within the q4_K block
++                    const uint32_t s0 = P[i].s0, s1 = P[i].s1, s2 = P[i].s2;
++                    uint32_t sca, mna, scb, mnb;
++                    if (cb < 2) {   // sub-blocks 0..3: 6-bit fields in bytes 0..3 (scales) and 4..7 (mins)
++                        sca = (s0 >> (16 * cb)) & 0x3F;     mna = (s1 >> (16 * cb)) & 0x3F;
++                        scb = (s0 >> (16 * cb + 8)) & 0x3F; mnb = (s1 >> (16 * cb + 8)) & 0x3F;
++                    } else {        // sub-blocks 4..7: low 4 bits from bytes 8..11, high 2 bits from the tops of bytes 0..7
++                        const int sa = 16 * (cb - 2), sb = sa + 8;
++                        sca = ((s2 >> sa) & 0x0F) | (((s0 >> (sa + 6)) & 0x3) << 4);
++                        mna = ((s2 >> (sa + 4)) & 0x0F) | (((s1 >> (sa + 6)) & 0x3) << 4);
++                        scb = ((s2 >> sb) & 0x0F) | (((s0 >> (sb + 6)) & 0x3) << 4);
++                        mnb = ((s2 >> (sb + 4)) & 0x0F) | (((s1 >> (sb + 6)) & 0x3) << 4);
++                    }
++                    const float d    = (float) sycl::bit_cast<sycl::half>((uint16_t) (P[i].sd & 0xFFFF));
++                    const float dmin = (float) sycl::bit_cast<sycl::half>((uint16_t) (P[i].sd >> 16));
++                    fda[i] = d * (float) sca; fma_[i] = dmin * (float) mna;
++                    fdb[i] = d * (float) scb; fmb[i]  = dmin * (float) mnb;
++                }
++            };
++            // dequant units [u0, u0+NUN) of a stage (one piece): each unit = one dword of nibbles = 8 weights ->
++            // 2 low-nibble + 2 high-nibble VNNI dwords. With DQ_BW the 16 lanes (= the 16 rows of a tile) write
++            // them with sub-group block stores: dword j of lane l lands at base + j*16 + l, exactly [k/2][row%16].
++            auto stage_units = [&](auto nun_tag, int u0, int buf, const Piece (&P)[PPI]) {
++                constexpr int NUN = decltype(nun_tag)::value;
++                const int i = u0 / PDW, dw0 = u0 % PDW;
++                int r16, hh, rt16, c; pgeo(i, r16, hh, rt16, c);
++                const int kp0 = (hh * PB + dw0 * 4) / 2;
++                uint32_t lo[2 * NUN], hi[2 * NUN];
++#pragma unroll
++                for (int n = 0; n < NUN; ++n) {
++                    const uint32_t x  = P[i].q[dw0 + n];
++                    const uint32_t tl = x & 0x0F0F0F0Fu, th = (x >> 4) & 0x0F0F0F0Fu;   // 4 low / 4 high nibbles as bytes
++#pragma unroll
++                    for (int pp = 0; pp < 2; ++pp) {
++#if DQ_DBG == 1
++                        lo[2 * n + pp] = tl >> pp; hi[2 * n + pp] = th >> pp;
++#else
++                        const sycl::half l0 = (sycl::half) sycl::fma(fda[i], (float) (uint8_t) (tl >> (16 * pp)),     -fma_[i]);
++                        const sycl::half l1 = (sycl::half) sycl::fma(fda[i], (float) (uint8_t) (tl >> (16 * pp + 8)), -fma_[i]);
++                        const sycl::half h0 = (sycl::half) sycl::fma(fdb[i], (float) (uint8_t) (th >> (16 * pp)),     -fmb[i]);
++                        const sycl::half h1 = (sycl::half) sycl::fma(fdb[i], (float) (uint8_t) (th >> (16 * pp + 8)), -fmb[i]);
++                        lo[2 * n + pp] = (uint32_t) sycl::bit_cast<uint16_t>(l0) | ((uint32_t) sycl::bit_cast<uint16_t>(l1) << 16);
++                        hi[2 * n + pp] = (uint32_t) sycl::bit_cast<uint16_t>(h0) | ((uint32_t) sycl::bit_cast<uint16_t>(h1) << 16);
++#endif
++                    }
++                }
++                const int base = buf * BUF_DW + rt16 * RT_DW + c * 32 * 16;
++#if DQ_BW
++                sycl::vec<uint32_t, 2 * NUN> vl, vh;
++#pragma unroll
++                for (int n = 0; n < 2 * NUN; ++n) { vl[n] = lo[n]; vh[n] = hi[n]; }
++#ifdef __SYCL_DEVICE_ONLY__
++                sycl::detail::sub_group::store<2 * NUN>(sp + base + kp0 * 16, vl);
++                sycl::detail::sub_group::store<2 * NUN>(sp + base + (kp0 + 16) * 16, vh);
++#else
++                (void) vl; (void) vh; (void) base; (void) kp0;
++#endif
++#else
++#pragma unroll
++                for (int n = 0; n < 2 * NUN; ++n) {
++                    sp[base + (kp0 + n) * 16 + r16]      = lo[n];
++                    sp[base + (kp0 + 16 + n) * 16 + r16] = hi[n];
++                }
++#endif
++            };
++            using one_t = std::integral_constant<int, 1>;
++            using piece_t = std::integral_constant<int, PDW>;
++
++            Cmat C[NA][NB];
++#pragma unroll
++            for (int a = 0; a < NA; ++a)
++#pragma unroll
++                for (int j = 0; j < NB; ++j) { mx::joint_matrix_fill(sg, C[a][j], 0.f); }
++
++            const bool sg_active = !CHECKED || t0 < N;          // uniform per sub-group
++            auto actg = sycl::address_space_cast<address_space::global_space, decorated::no>(act);
++
++            // operand loads (A from global, B from SLM buffer `buf`)
++            auto load_A = [&](Amat (&A)[NA], int stg, int kk) {
++                const int kg = stg * KC + kk * TK;
++#pragma unroll
++                for (int a = 0; a < NA; ++a) {
++                    if (CHECKED && t0 + (a + 1) * TM > N) {   // only tiles that straddle / pass the end are checked
++                        imx::joint_matrix_load_checked(sg, A[a], actg, K, N, K, t0 + a * TM, kg);
++                    } else if (DQ_DBG == 4) {
++                        mx::joint_matrix_load(sg, A[a], actg + (size_t) (t0 + a * TM) * K + kk * TK, K);
++                    } else {
++                        mx::joint_matrix_load(sg, A[a], actg + (size_t) (t0 + a * TM) * K + kg, K);
++                    }
++                }
++            };
++            auto bbase = [&](int buf) { return sph + buf * (BUF_DW * 2) + (sr * NB) * (RT_DW * 2); };
++
++            Piece Pc[PPI], Pn[PPI];                               // current (stage s+1) and next (stage s+2) global data
++            // prologue: stage 0 -> buffer 0, stage 1 in registers
++            stage_load(0, Pc);
++            stage_scales(0, Pc);
++#pragma unroll
++            for (int i = 0; i < PPI; ++i) { stage_units(piece_t{}, i * PDW, 0, Pc); }
++            stage_load(NS > 1 ? 1 : 0, Pc);
++            sycl::group_barrier(it.get_group());
++
++            for (int stg = 0; stg < NS; ++stg) {
++                // the last stage dequantizes a clamped duplicate into the idle buffer: no branch in the loop body
++                const int sn = stg + 1 < NS ? stg + 1 : stg;
++                if (DQ_DBG != 3) {
++                    stage_load(stg + 2 < NS ? stg + 2 : NS - 1, Pn);  // clamped, unconditional
++                    stage_scales(sn, Pc);
++                    if (!DQ_ILV) {
++#pragma unroll
++                        for (int i = 0; i < PPI; ++i) { stage_units(piece_t{}, i * PDW, (stg + 1) & 1, Pc); }
++                    }
++                }
++                const auto bb = bbase(stg & 1);
++#pragma unroll
++                for (int kk = 0; kk < KS; ++kk) {
++                    if (sg_active) {
++                        Amat A[NA]; Bmat B[NB];
++                        load_A(A, stg, kk);
++#pragma unroll
++                        for (int j = 0; j < NB; ++j) { mx::joint_matrix_load(sg, B[j], bb + j * (RT_DW * 2) + kk * 256, 32); }
++#pragma unroll
++                        for (int a = 0; a < NA; ++a)
++#pragma unroll
++                            for (int j = 0; j < NB; ++j) {
++                                if (DQ_DBG != 2 || (a == 0 && j == 0)) { mx::joint_matrix_mad(sg, C[a][j], A[a], B[j], C[a][j]); }
++                            }
++                    }
++                    if (DQ_ILV && DQ_DBG != 3) {
++                        // this step's share of the next stage's dequant units
++#pragma unroll
++                        for (int u = kk * NU / KS; u < (kk + 1) * NU / KS; ++u) { stage_units(one_t{}, u, (stg + 1) & 1, Pc); }
++                    }
++                }
++                if (DQ_DBG != 3) {
++#pragma unroll
++                    for (int i = 0; i < PPI; ++i) { Pc[i] = Pn[i]; }
++                }
++                sycl::group_barrier(it.get_group());
++            }
++
++            if (sg_active) {
++                auto dg = sycl::address_space_cast<address_space::global_space, decorated::no>(dst);
++#pragma unroll
++                for (int a = 0; a < NA; ++a)
++#pragma unroll
++                    for (int j = 0; j < NB; ++j) {
++                        const int row = rw0 + (sr * NB + j) * TN;
++                        if (CHECKED && t0 + (a + 1) * TM > N) {
++                            imx::joint_matrix_store_checked(sg, C[a][j], dg, ldd, mx::layout::row_major, N, M, t0 + a * TM, row);
++                        } else {
++                            mx::joint_matrix_store(sg, C[a][j], dg + (size_t) (t0 + a * TM) * ldd + row, ldd, mx::layout::row_major);
++                        }
++                    }
++            }
++          };
++          if ((int) (it.get_group(0) % ntt) >= nfull) { body(std::true_type{}); } else { body(std::false_type{}); }
++        });
++    });
++}
++} // namespace dqg
++
++bool dq_gemm_q4k_supported(int64_t M, int64_t N, int64_t K) {
++    return K > 0 && K % 256 == 0 && K % dqg::KC == 0 && M > 0 && M % dqg::WG_R == 0 && N >= 1 &&
++           M < (1ll << 24) && N < (1ll << 24) && K < (1ll << 24);
++}
++
++sycl::event dq_gemm_q4k(sycl::queue & q, const void * w, const sycl::half * act, float * dst,
++                        int64_t M, int64_t N, int64_t K, int64_t ldd) {
++    const int nfull = (int) (N / dqg::WG_T);
++    const int tail  = (int) (N - (int64_t) nfull * dqg::WG_T);
++    return dqg::launch(q, (const uint8_t *) w, act, dst, (int) M, (int) N, (int) K, (int) ldd, nfull, nfull + (tail > 0 ? 1 : 0));
++}
+diff --git a/ggml/src/ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.hpp b/ggml/src/ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.hpp
+new file mode 100644
+index 0000000000..00ca8f5118
+--- /dev/null
++++ b/ggml/src/ggml-sycl/dq-gemm-kernel/dq_gemm_q4k.hpp
+@@ -0,0 +1,24 @@
++// dq_gemm_q4k: q4_K x f16 -> f32 GEMM for llama.cpp PREFILL on Intel Xe2 (Arc Pro B70), SYCL.
++// The q4_K weights are dequantized to f16 INSIDE the kernel (once per work-group tile, into SLM) and fed to the f16
++// DPAS (joint_matrix 8x16x16) with f32 accumulation over the whole K loop. Numerics = "dequantize to f16, then f16
++// GEMM with f32 accumulation" (the current ggml-sycl prefill path); only the summation order differs.
++//
++// Naming follows ggml / the integration side: M = weight rows (ne01), N = token columns (ne11), K = ne00.
++//
++//   w   : ggml-sycl q4_K REORDER layout of the whole tensor, nb = M*K/256 blocks, block i = row*(K/256) + kb:
++//           qs     at w + 0          (nb * 128 B, block i's 128 B contiguous, same nibble order as block_q4_K.qs)
++//           scales at w + nb*128     (nb * 12 B, same packing as block_q4_K.scales)
++//           dm     at w + nb*140     (nb x half2: d, dmin)
++//   act : f16, N rows of K contiguous: act[n*K + k]
++//   dst : f32, dst[n*ldd + m], ldd >= M. Overwritten (beta = 0).
++// Asynchronous: submits ONE kernel on q (a ragged last token tile is handled inside it);
++// no host sync, no allocations.
++#pragma once
++#include <sycl/sycl.hpp>
++#include <cstdint>
++
++// true when the kernel handles this shape: K % 256 == 0, M % 128 == 0, N >= 1, 16-byte-aligned pointers and ldd % 4 == 0
++bool dq_gemm_q4k_supported(int64_t M, int64_t N, int64_t K);
++
++sycl::event dq_gemm_q4k(sycl::queue & q, const void * w, const sycl::half * act, float * dst,
++                        int64_t M, int64_t N, int64_t K, int64_t ldd);
+diff --git a/ggml/src/ggml-sycl/dq-gemm.cpp b/ggml/src/ggml-sycl/dq-gemm.cpp
+new file mode 100644
+index 0000000000..1f62710ade
+--- /dev/null
++++ b/ggml/src/ggml-sycl/dq-gemm.cpp
+@@ -0,0 +1,244 @@
++//
++// LOCAL (not for upstream): prefill dq-gemm dispatch target, see dq-gemm.hpp.
++//
++#include "dq-gemm.hpp"
++
++#include "convert.hpp"
++#include "fattn-xmx.hpp"
++#include "gemm.hpp"
++#include "mmq-dnn-u4.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#if defined(GGML_SYCL_DQ_GEMM_HAVE_FUSED) && GGML_SYCL_DQ_GEMM_HAVE_FUSED
++#    include "dq-gemm-kernel/dq_gemm_q4k.hpp"
++#    define DQ_GEMM_FUSED 1
++#else
++#    define DQ_GEMM_FUSED 0
++#endif
++
++extern int g_ggml_sycl_enable_dnn;
++
++static int dq_gemm_env_int(const char * name, int def) {
++    const char * e = getenv(name);
++    return e && *e ? atoi(e) : def;
++}
++
++bool ggml_sycl_dq_gemm_env() {
++#if GGML_SYCL_XMX
++    static const bool v = dq_gemm_env_int("GGML_SYCL_DQ_GEMM", 0) != 0;   // default off
++    return v;
++#else
++    return false;
++#endif
++}
++
++int ggml_sycl_dq_gemm_min_cols() {
++    // 17 at the least: 1..16 columns are the decode / verify window (MMVQ, XMX q4_K 3..16, XMX q6_K 3..8).
++    // Default 33: the dequantize is a fixed cost (~850 us on 17408x5120) whatever the column count, so the path wins
++    // from 17 columns up, but ubatches <= GGML_SYCL_GRAPH_MAX_TOKENS (32) are recorded into SYCL graphs; starting at
++    // 33 keeps dq-gemm eager-only (17..32 pass the graph self-test too, GGML_SYCL_DQ_GEMM_MIN_COLS=17 opts in)
++    static const int v = std::max(17, dq_gemm_env_int("GGML_SYCL_DQ_GEMM_MIN_COLS", 33));
++    return v;
++}
++
++int ggml_sycl_dq_gemm_max_cols() {
++    // GGML_SYCL_DQ_GEMM_MAX_COLS (default 0 = no limit): above it the op stays on dequantize + oneDNN, for a kernel
++    // that wins on short ubatches / tails but not (yet) on full 2048-token ones
++    static const int v = std::max(0, dq_gemm_env_int("GGML_SYCL_DQ_GEMM_MAX_COLS", 0));
++    return v;
++}
++
++static bool ggml_sycl_dq_gemm_q6k_env() {
++    static const bool v = dq_gemm_env_int("GGML_SYCL_DQ_GEMM_Q6K", 0) != 0;
++    return v;
++}
++
++// which kernel entry serves the op: 0 = reference (dequantize + oneDNN), 1 = fused kernel
++enum dq_gemm_impl { DQ_GEMM_IMPL_REF = 0, DQ_GEMM_IMPL_FUSED = 1 };
++
++static dq_gemm_impl ggml_sycl_dq_gemm_impl(int device, const ggml_tensor * src0, const ggml_tensor * src1,
++                                           const ggml_tensor * dst) {
++    // GGML_SYCL_DQ_GEMM_IMPL: "ref" forces the reference; default (or "fused"): the fused kernel whenever it is
++    // compiled in and takes the shape, else the reference
++    static const bool want_ref = [] {
++        const char * e = getenv("GGML_SYCL_DQ_GEMM_IMPL");
++        return e && strcmp(e, "ref") == 0;
++    }();
++    // GGML_SYCL_DQ_GEMM_FUSED_MAX_COLS (default 1536, 0 = no limit): above it the reference serves the op. The fused
++    // kernel runs ~100 TFLOPS in steady state vs oneDNN's ~146 on the f16 scratch, so it wins while the fixed
++    // dequantize cost dominates (short ubatches, ragged tails; measured up to 1536 columns) and is at parity or
++    // behind from ~1792 (full 2048-token ubatches)
++    static const int fused_max = std::max(0, dq_gemm_env_int("GGML_SYCL_DQ_GEMM_FUSED_MAX_COLS", 1536));
++    if (want_ref || (fused_max > 0 && src1->ne[1] > fused_max)) {
++        return DQ_GEMM_IMPL_REF;
++    }
++#if DQ_GEMM_FUSED
++    const int64_t M   = src0->ne[1];
++    const int64_t N   = src1->ne[1];
++    const int64_t K   = src0->ne[0];
++    const int64_t ldd = dst->nb[1] / sizeof(float);
++    if (src0->type == GGML_TYPE_Q4_K && dq_gemm_q4k_supported(M, N, K) && ldd % 4 == 0 &&
++        ((uintptr_t) dst->data) % 16 == 0 && ((uintptr_t) src0->data) % 16 == 0 &&
++        ggml_sycl_fattn_xmx_device_ok(device)) {   // the same f16 matrix-hardware probe as the XMX FA path
++        return DQ_GEMM_IMPL_FUSED;
++    }
++#else
++    GGML_UNUSED(device);
++    GGML_UNUSED(src0);
++    GGML_UNUSED(src1);
++    GGML_UNUSED(dst);
++#endif
++    return DQ_GEMM_IMPL_REF;
++}
++
++bool ggml_sycl_dq_gemm_can_use(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                               const ggml_tensor * dst) {
++
++    if (!ggml_sycl_dq_gemm_env()) {
++        return false;
++    }
++    if (!(src0->type == GGML_TYPE_Q4_K || (src0->type == GGML_TYPE_Q6_K && ggml_sycl_dq_gemm_q6k_env()))) {
++        return false;
++    }
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (dst->op != GGML_OP_MUL_MAT) {   // MUL_MAT_ID comes through the same dispatcher with a stack dst
++        return false;
++    }
++    if (dst->op_params[0] != GGML_PREC_DEFAULT) {   // the f16 path the reference stands in for has the same rule
++        return false;
++    }
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
++        return false;
++    }
++    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
++        return false;
++    }
++    if (src1->ne[1] < ggml_sycl_dq_gemm_min_cols() ||
++        (ggml_sycl_dq_gemm_max_cols() > 0 && src1->ne[1] > ggml_sycl_dq_gemm_max_cols())) {
++        return false;
++    }
++    if (src0->ne[0] % QK_K != 0 || src1->ne[0] != src0->ne[0] || dst->ne[0] != src0->ne[1] ||
++        dst->ne[1] != src1->ne[1] || ggml_nbytes(src0) >= (size_t) INT_MAX) {
++        return false;
++    }
++    if (g_ggml_sycl_prioritize_dmmv || ggml_sycl_dnn_u4_enabled()) {
++        return false;
++    }
++#if !GGML_SYCL_DNNL
++    // the reference entry is built on oneDNN
++    if (ggml_sycl_dq_gemm_impl(ctx.device, src0, src1, dst) == DQ_GEMM_IMPL_REF) {
++        return false;
++    }
++#else
++    if (ggml_sycl_dq_gemm_impl(ctx.device, src0, src1, dst) == DQ_GEMM_IMPL_REF && !g_ggml_sycl_enable_dnn) {
++        return false;
++    }
++#endif
++    return true;
++}
++
++// f32 activations -> f16, N rows of K (the same round-to-nearest-even conversion ggml_sycl_op_mul_mat_sycl applies to
++// src1). The generic convert_unary kernel does 4D index math per element and reaches ~330 GB/s; this contiguous
++// float4 -> half4 kernel is used when the source is 16-byte aligned (GGML_SYCL_DQ_GEMM_FASTCVT=0 disables it).
++static void dq_gemm_act_to_f16(ggml_backend_sycl_context & ctx, const ggml_tensor * src1, ggml_tensor * dst,
++                               sycl::half * a16, const queue_ptr & stream) {
++    GGML_UNUSED(ctx);
++    static const bool fast = dq_gemm_env_int("GGML_SYCL_DQ_GEMM_FASTCVT", 1) != 0;
++    const float *     x    = static_cast<const float *>(src1->data);
++    const int64_t     n    = ggml_nelements(src1);
++    if (fast && n % 4 == 0 && ((uintptr_t) x) % 16 == 0 && ((uintptr_t) a16) % 8 == 0) {
++        const int64_t n4 = n / 4;
++        const int64_t wg = 256;
++        const auto *  xv = reinterpret_cast<const sycl::float4 *>(x);
++        auto *        yv = reinterpret_cast<sycl::vec<sycl::half, 4> *>(a16);
++        stream->parallel_for(sycl::nd_range<1>(((n4 + wg - 1) / wg) * wg, wg), [=](sycl::nd_item<1> it) {
++            const int64_t i = it.get_global_id(0);
++            if (i < n4) {
++                yv[i] = xv[i].convert<sycl::half, sycl::rounding_mode::rte>();
++            }
++        });
++        return;
++    }
++    const to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(src1->type, dst);
++    GGML_ASSERT(to_fp16 != nullptr);
++    to_fp16(static_cast<const float *>(src1->data), a16, ggml_nelements(src1), stream);
++}
++
++void ggml_sycl_mul_mat_dq_gemm(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                               ggml_tensor * dst) try {
++    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2, " : dq-gemm");
++
++    const int64_t K = src0->ne[0];   // reduction
++    const int64_t M = src0->ne[1];   // weight rows = output features
++    const int64_t N = src1->ne[1];   // tokens
++    GGML_ASSERT(src1->ne[0] == K && dst->ne[0] == M && dst->ne[1] == N);
++    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++    GGML_ASSERT(extra && extra->optimized_feature.reorder);
++
++    const queue_ptr stream = ctx.stream();
++    ggml_sycl_phase_timer pt(stream);
++
++    float *       out   = static_cast<float *>(dst->data);
++    const int64_t ldd   = dst->nb[1] / sizeof(float);
++    const bool    fused = ggml_sycl_dq_gemm_impl(ctx.device, src0, src1, dst) == DQ_GEMM_IMPL_FUSED;
++
++    // fused kernel, ragged token tail (N % tile): the kernel's bounds-checked tail launch is slow, so by default
++    // (GGML_SYCL_DQ_GEMM_PAD=1) the tail runs as one full, unchecked tile on zero-padded activations into a scratch,
++    // whose first rows are then copied to dst (dst is contiguous: ldd == M, the rows are one block)
++    static const int64_t tile = std::max(1, dq_gemm_env_int("GGML_SYCL_DQ_GEMM_TILE", 256));   // kernel's token tile
++    static const bool    pad  = dq_gemm_env_int("GGML_SYCL_DQ_GEMM_PAD", 1) != 0;
++    const int64_t n_full = (N / tile) * tile;
++    const int64_t n_tail = N - n_full;
++    const bool    padded = fused && pad && n_tail != 0 && ldd == M;
++
++    ggml_sycl_pool_alloc<sycl::half> a16(ctx.pool(), (padded ? n_full + tile : N) * K);
++    dq_gemm_act_to_f16(ctx, src1, dst, a16.get(), stream);
++    if (padded) {
++        stream->memset(a16.get() + N * K, 0, (size_t) (tile - n_tail) * K * sizeof(sycl::half));
++    }
++    pt.mark("act_f16");
++
++    if (fused) {
++#if DQ_GEMM_FUSED
++        if (!padded) {
++            dq_gemm_q4k(*stream, src0->data, a16.get(), out, M, N, K, ldd);
++        } else {
++            if (n_full > 0) {
++                dq_gemm_q4k(*stream, src0->data, a16.get(), out, M, n_full, K, ldd);
++            }
++            ggml_sycl_pool_alloc<float> tail(ctx.pool(), tile * M);
++            dq_gemm_q4k(*stream, src0->data, a16.get() + n_full * K, tail.get(), M, tile, K, M);
++            stream->memcpy(out + n_full * ldd, tail.get(), (size_t) n_tail * M * sizeof(float));
++        }
++        pt.mark("fused", "fused_host");
++        return;
++#endif
++    }
++
++#if GGML_SYCL_DNNL
++    // reference: the existing pieces (reorder-aware dequantize to an f16 scratch, oneDNN f16 GEMM)
++    GGML_ASSERT(ldd == M);
++    const to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(src0->type, dst);   // picks the _reorder variant
++    GGML_ASSERT(to_fp16 != nullptr);
++    ggml_sycl_pool_alloc<sycl::half> w16(ctx.pool(), M * K);
++    to_fp16(src0->data, w16.get(), M * K, stream);
++    pt.mark("dequant");
++    DnnlGemmWrapper::row_gemm(ctx, (int) M, (int) N, (int) K, w16.get(), DnnlGemmWrapper::to_dt<sycl::half>(),
++                              a16.get(), DnnlGemmWrapper::to_dt<sycl::half>(), out,
++                              DnnlGemmWrapper::to_dt<float>(), stream);
++    pt.mark("gemm", "gemm_host");
++#else
++    GGML_ABORT("dq-gemm reference entry needs oneDNN");
++#endif
++} catch (const sycl::exception & exc) {
++    std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
++    std::exit(1);
++}
+diff --git a/ggml/src/ggml-sycl/dq-gemm.hpp b/ggml/src/ggml-sycl/dq-gemm.hpp
+new file mode 100644
+index 0000000000..9d5bb6f8f2
+--- /dev/null
++++ b/ggml/src/ggml-sycl/dq-gemm.hpp
+@@ -0,0 +1,86 @@
++//
++// LOCAL (not for upstream): prefill mul_mat for q4_K (and q6_K) weights in the MMVQ reorder layout, with the
++// dequantization fused into an f16 DPAS GEMM ("dq-gemm").
++//
++// Today's prefill path (ggml_sycl_op_mul_mat_sycl) dequantizes the whole weight to an f16 N x K scratch buffer
++// (17408x5120 -> 178 MB written, then read back by the GEMM), converts the f32 activations to f16 and runs the
++// oneDNN f16 GEMM. dq-gemm replaces the three steps with one kernel entry that reads the quantized weights in place.
++//
++// Dispatch (ggml_sycl_mul_mat): q4_K (q6_K with GGML_SYCL_DQ_GEMM_Q6K=1) x f32 -> f32, 2D contiguous, src1 columns
++// >= GGML_SYCL_DQ_GEMM_MIN_COLS (default 33 = above GGML_SYCL_GRAPH_MAX_TOKENS, so never graph-recorded; never below
++// 17: the decode / verify window <= 16 belongs to the XMX MMVQ-replacement paths) and <= GGML_SYCL_DQ_GEMM_MAX_COLS
++// (default 0 = no limit), weights reordered by the caller (the same reorder MMVQ installs at decode).
++// Fused kernel, ragged token tails: run as one padded full tile into a scratch (GGML_SYCL_DQ_GEMM_PAD=1, default).
++// Runtime switch GGML_SYCL_DQ_GEMM=1 (default 0). Built only with -DGGML_SYCL_XMX=ON.
++//
++// The kernel entry is pluggable (GGML_SYCL_DQ_GEMM_IMPL): "ref" is a reference implementation made of the existing
++// pieces (reorder dequantize -> f16 scratch, f32 -> f16 activations, oneDNN f16 GEMM), "fused" is the fused kernel
++// when it is compiled in (GGML_SYCL_DQ_GEMM_HAVE_FUSED, dq-gemm-kernel/). Default: fused when present and it takes
++// the shape and N <= GGML_SYCL_DQ_GEMM_FUSED_MAX_COLS (default 1536, 0 = no limit), else ref. Both entries convert the
++// activations with a contiguous vectorised f32 -> f16 kernel (GGML_SYCL_DQ_GEMM_FASTCVT=1, default).
++//
++// Prefill stays eager: a ubatch above GGML_SYCL_GRAPH_MAX_TOKENS (32) is never recorded into a SYCL graph, and the
++// path makes no host synchronisation of its own.
++//
++#ifndef GGML_SYCL_DQ_GEMM_HPP
++#define GGML_SYCL_DQ_GEMM_HPP
++
++#include "common.hpp"
++
++#include <chrono>
++
++// value of GGML_SYCL_DQ_GEMM (default 0), read once; false when not built with -DGGML_SYCL_XMX=ON
++bool ggml_sycl_dq_gemm_env();
++
++// GGML_SYCL_DQ_GEMM_MIN_COLS (default 33, clamped to >= 17)
++int ggml_sycl_dq_gemm_min_cols();
++
++// GGML_SYCL_DQ_GEMM_MAX_COLS (default 0 = no upper limit)
++int ggml_sycl_dq_gemm_max_cols();
++
++// true when src0 x src1 -> dst is a prefill mul_mat this path serves (type, shape, column count, env); no side
++// effects. The caller must still install the reorder layout on src0 and check it took.
++bool ggml_sycl_dq_gemm_can_use(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                               const ggml_tensor * dst);
++
++// the whole mul_mat on ctx.stream() for a src0 already in the reorder layout
++void ggml_sycl_mul_mat_dq_gemm(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                               ggml_tensor * dst);
++
++// ---- sub-phase profiling hooks for GGML_SYCL_OP_PROFILE (defined in ggml-sycl.cpp) ----
++// true while the per-op profiler is timing the current op
++bool ggml_sycl_op_prof_active();
++// adds `ms` under "<current op key>/<sub>" (not counted into the graph total)
++void ggml_sycl_op_prof_sub_add(const char * sub, double ms);
++
++// waits on the stream at each mark() and books the time since the previous mark to a sub-phase of the current op;
++// no-op (no waits) unless the profiler is active
++struct ggml_sycl_phase_timer {
++    dpct::queue_ptr                       q;
++    bool                                  on;
++    std::chrono::steady_clock::time_point t;
++
++    explicit ggml_sycl_phase_timer(dpct::queue_ptr q) : q(q), on(ggml_sycl_op_prof_active()) {
++        if (on) {
++            q->wait();
++            t = std::chrono::steady_clock::now();
++        }
++    }
++
++    // host_sub != nullptr: also book the host time until mark() was called (submission cost) under host_sub
++    void mark(const char * sub, const char * host_sub = nullptr) {
++        if (!on) {
++            return;
++        }
++        const auto th = std::chrono::steady_clock::now();
++        q->wait();
++        const auto t1 = std::chrono::steady_clock::now();
++        if (host_sub) {
++            ggml_sycl_op_prof_sub_add(host_sub, std::chrono::duration<double, std::milli>(th - t).count());
++        }
++        ggml_sycl_op_prof_sub_add(sub, std::chrono::duration<double, std::milli>(t1 - t).count());
++        t = std::chrono::steady_clock::now();
++    }
++};
++
++#endif // GGML_SYCL_DQ_GEMM_HPP
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 44d8331c8a..74f1a96d35 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -69,6 +69,7 @@
+ #include "ggml-sycl/mmq-dnn-u4.hpp"
+ #include "ggml-sycl/mmq-xmx-q4k.hpp"
+ #include "ggml-sycl/mmq-xmx-q6k.hpp"
++#include "ggml-sycl/dq-gemm.hpp"
+ #include "ggml-sycl/fattn-xmx.hpp"
+ #include "ggml-sycl/getrows.hpp"
+ #include "ggml-sycl/mem.hpp"
+@@ -461,6 +462,8 @@ static void ggml_check_sycl() try {
+             }
+             GGML_LOG_INFO(")\n");
+             GGML_LOG_INFO("  GGML_SYCL_XMX_Q6K: %d (built, same matrix check)\n", (int) ggml_sycl_xmx_q6k_env());
++            GGML_LOG_INFO("  GGML_SYCL_DQ_GEMM: %d (cols %d..%d)\n", (int) ggml_sycl_dq_gemm_env(),
++                          ggml_sycl_dq_gemm_min_cols(), ggml_sycl_dq_gemm_max_cols());
+         } else {
+             GGML_LOG_INFO("  GGML_SYCL_XMX_Q4K: %d (not built, -DGGML_SYCL_XMX=OFF)\n", (int) ggml_sycl_xmx_q4k_env());
+             GGML_LOG_INFO("  GGML_SYCL_XMX_Q6K: %d (not built, -DGGML_SYCL_XMX=OFF)\n", (int) ggml_sycl_xmx_q6k_env());
+@@ -3001,6 +3004,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
+ 
+     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
+         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
++        // LOCAL: sub-phase times under GGML_SYCL_OP_PROFILE (no waits otherwise)
++        ggml_sycl_phase_timer pt(stream);
+         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
+         if (src0->type != GGML_TYPE_F16) {
+             scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
+@@ -3010,6 +3015,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
+             size_t ne = row_diff*ne00;
+             src0_as_f16.alloc(ne);
+             to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
++            pt.mark(src0->extra && ((ggml_tensor_extra_gpu *) src0->extra)->optimized_feature.reorder ?
++                        "dequant(reorder)" : "dequant(plain)");
+         }
+         const sycl::half *src0_ptr = src0->type == GGML_TYPE_F16
+                                          ? (const sycl::half *)src0_dd_i
+@@ -3024,6 +3031,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
+             size_t ne = src1_ncols*ne10;
+             src1_as_f16.alloc(ne);
+             to_fp16_sycl(src1_ddf_i, src1_as_f16.get(), ne, stream);
++            pt.mark("act_f16");
+         }
+         const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
+                 ? (const sycl::half *)src1->data + src1_padded_row_size
+@@ -3034,6 +3042,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
+                 DnnlGemmWrapper::row_gemm(ctx,row_diff, src1_ncols , ne10, src0_ptr,
+                                      DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
+                                       dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
++                pt.mark("gemm", "gemm_host");
+         }
+         else
+ #endif
+@@ -4915,6 +4924,17 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+                    __func__, src0->name, ggml_type_name(src1->type), (long long) src1->ne[0], (long long) src1->ne[1],
+                    (long long) src1->ne[2], ggml_type_name(dst->type));
+     }
++    // LOCAL: prefill (>= GGML_SYCL_DQ_GEMM_MIN_COLS columns) q4_K / q6_K on the dq-gemm entry (dq-gemm.cpp). It reads
++    // the MMVQ reorder layout, so it installs the same reorder here (a no-op once decode has done it). Default off
++    // (GGML_SYCL_DQ_GEMM=1). Without the reorder (GGML_SYCL_ENABLE_OPT=0, ...) the op stays on the path below.
++    if (!split && ggml_sycl_dq_gemm_can_use(ctx, src0, src1, dst)) {
++        opt_for_reorder_id(&ctx, src0);
++        const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
++        if (extra && extra->optimized_feature.reorder) {
++            ggml_sycl_mul_mat_dq_gemm(ctx, src0, src1, dst);
++            return;
++        }
++    }
+     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
+         // TODO: Refactor and cleanup of mul mat dispatching.
+         if (src0->ne[3] == 1 && src1->ne[3] == 1) {
+@@ -6158,6 +6178,20 @@ struct ggml_sycl_op_prof_bucket { int64_t graphs = 0; int64_t skipped = 0; doubl
+ static std::map<std::pair<int, int64_t>, ggml_sycl_op_prof_bucket> g_sycl_op_prof; // (n_nodes, n_tokens)
+ static ggml_sycl_op_prof_bucket * g_sycl_op_prof_cur = nullptr;
+ static int64_t g_sycl_op_prof_total_graphs = 0;
++static const std::string * g_sycl_op_prof_cur_key = nullptr;   // key of the op being timed (sub-phase rows)
++
++bool ggml_sycl_op_prof_active() {
++    return g_sycl_op_prof_cur != nullptr && g_sycl_op_prof_cur_key != nullptr;
++}
++
++void ggml_sycl_op_prof_sub_add(const char * sub, double ms) {
++    if (!ggml_sycl_op_prof_active()) {
++        return;
++    }
++    auto & acc = g_sycl_op_prof_cur->ops[*g_sycl_op_prof_cur_key + "  /" + sub];
++    acc.ms += ms;
++    acc.n  += 1;
++}
+ 
+ static void ggml_sycl_op_prof_print() {
+     for (auto & kv : g_sycl_op_prof) {
+@@ -6167,8 +6201,10 @@ static void ggml_sycl_op_prof_print() {
+         std::vector<std::pair<std::string, ggml_sycl_op_prof_acc>> rows(b.ops.begin(), b.ops.end());
+         std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & c) { return a.second.ms > c.second.ms; });
+         for (const auto & r : rows) {
+-            fprintf(stderr, "[sycl-prof]   %-40s %9.3f ms/graph %5.1f%%  x%.1f/graph\n", r.first.c_str(),
+-                    r.second.ms / b.graphs, 100.0 * r.second.ms / b.ms, (double) r.second.n / b.graphs);
++            fprintf(stderr, "[sycl-prof]   %-40s %9.3f ms/graph %5.1f%%  x%.1f/graph  (%.4f ms/call, %lld calls)\n",
++                    r.first.c_str(), r.second.ms / b.graphs, 100.0 * r.second.ms / b.ms,
++                    (double) r.second.n / b.graphs, r.second.ms / std::max<int64_t>(1, r.second.n),
++                    (long long) r.second.n);
+         }
+     }
+     fflush(stderr);
+@@ -6192,6 +6228,9 @@ static std::string ggml_sycl_op_prof_key(const ggml_tensor * node) {
+         key += std::string("_") + ggml_unary_op_name(ggml_get_unary_op(node));
+     } else if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+         key += std::string("_") + ggml_type_name(node->src[0]->type) + "_n" + std::to_string(node->ne[1]);
++        if (node->ne[1] > 16) {   // LOCAL: prefill-size ops also keyed by weight shape (m x k)
++            key += "_" + std::to_string(node->src[0]->ne[1]) + "x" + std::to_string(node->src[0]->ne[0]);
++        }
+     } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+         key += "_kv" + std::to_string(node->src[1]->ne[1]) + "_n" + std::to_string(node->src[0]->ne[1]);
+     } else if (node->op == GGML_OP_GATED_DELTA_NET) {
+@@ -6211,10 +6250,12 @@ struct ggml_sycl_op_prof_scope {
+         ctx = c;
+         key = ggml_sycl_op_prof_key(node);
+         ctx->stream()->wait();
++        g_sycl_op_prof_cur_key = &key;
+         t0 = std::chrono::steady_clock::now();
+     }
+     ~ggml_sycl_op_prof_scope() {
+         if (ctx == nullptr) return;
++        g_sycl_op_prof_cur_key = nullptr;
+         ctx->stream()->wait();
+         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+         auto & acc = g_sycl_op_prof_cur->ops[key];
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 850a166d64..b38b5e5f85 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1189,6 +1189,11 @@ static bool op_filter_entry_matches(std::string_view entry, std::string_view op_
+ struct test_case {
+     virtual ~test_case() {}
+ 
++    // LOCAL (not for upstream): perf mode computes this tensor once, in a graph of its own, before the warmup run
++    // and outside the timed region (build_graph may set it; e.g. a decode-size op that installs a backend's
++    // weight layout the way a model's decode steps would before a prefill)
++    ggml_tensor * perf_pre = nullptr;
++
+     virtual std::string op_desc(ggml_tensor * t) {
+         return ggml_op_desc(t);
+     }
+@@ -1568,11 +1573,13 @@ struct test_case {
+ 
+         ggml_init_params params = {
+             // LOCAL: 2048 tensors (was 128) so the multi-layer chain cases (GDN_CHAIN nl=48) fit
+-            /* .mem_size = */ ggml_tensor_overhead()*2048 + ggml_graph_overhead_custom(graph_nodes, false),
++            /* .mem_size = */ ggml_tensor_overhead()*2048 + ggml_graph_overhead_custom(graph_nodes, false) +
++                              ggml_graph_overhead_custom(64, false),   // LOCAL: + the perf_pre graph
+             /* .mem_base = */ NULL,
+             /* .no_alloc = */ true,
+         };
+         const bool use_weights = use_weight_context();
++        perf_pre = nullptr;
+ 
+         ggml_context_ptr ctx(ggml_init(params)); // smart ptr
+         GGML_ASSERT(ctx);
+@@ -1620,6 +1627,17 @@ struct test_case {
+             initialize_tensors(ctx_weights.get());
+         }
+ 
++        // LOCAL: the perf_pre tensor, once, untimed
++        if (perf_pre != nullptr) {
++            ggml_cgraph * gp = ggml_new_graph_custom(ctx.get(), 64, false);
++            ggml_build_forward_expand(gp, perf_pre);
++            if (ggml_backend_graph_compute(backend, gp) != GGML_STATUS_SUCCESS) {
++                fprintf(stderr, "%s: perf_pre graph failed\n", __func__);
++                return false;
++            }
++            ggml_backend_synchronize(backend);
++        }
++
+         // build graph
+         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+         ggml_build_forward_expand(gf, out);
+@@ -5180,6 +5198,31 @@ struct test_mul_mat : public test_case {
+     }
+ };
+ 
++// LOCAL (not for upstream): a prefill-size mul_mat whose weight has first been through one decode-size (1 column)
++// mul_mat, untimed (perf_pre), as in a server that has decoded before it prefills. On SYCL that decode step installs
++// the MMVQ reorder layout, so the prefill op measures the reorder variant of the dequantize the seat actually runs.
++// The graph itself is the plain mul_mat (eval mode is identical to MUL_MAT).
++struct test_mul_mat_prefill : public test_mul_mat {
++    test_mul_mat_prefill(ggml_type type_a, int64_t m, int64_t n, int64_t k)
++        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }) {}
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "MUL_MAT_PREFILL";
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * out = test_mul_mat::build_graph(ctx);
++        ggml_tensor * a = ggml_get_tensor(ctx, "a");
++        GGML_ASSERT(a != nullptr);
++        ggml_tensor * b1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
++        ggml_set_name(b1, "b_decode");
++        perf_pre = ggml_mul_mat(ctx, a, b1);
++        ggml_set_name(perf_pre, "out_decode");
++        return out;
++    }
++};
++
+ // GGML_HINT_SRC0_IS_HADAMARD
+ struct test_mul_mat_hadamard : public test_mul_mat {
+     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
+@@ -10124,6 +10167,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // LOCAL (not for upstream): prefill-size q4_K / q6_K at the house model's shapes (SYCL dq-gemm path,
++    // GGML_SYCL_DQ_GEMM=1: full 2048-token ubatches, a ragged tail and a 512 ubatch)
++    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120} }) {
++        for (int nc : { 512, 700, 2048 }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++            if ((nw == 5120 && kw == 17408) || (nw == 10240 && kw == 5120)) {
++                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++            }
++        }
++    }
++    // LOCAL: dq-gemm edges: around the default 64-column threshold, a token count off every tile, rows off the fused
++    // kernel's 128-row tile (4100) and a tiny weight (48 rows, ssm_alpha) that the reference entry serves
++    for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
++        for (int nc : { 17, 32, 33, 63, 64, 65, 257, 300 }) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, nc, 1024, { 1, 1 }, { 1, 1 }));
++        }
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4100, 128, 1024, { 1, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48, 512, 5120, { 1, 1 }, { 1, 1 }));
++    }
++
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+@@ -11361,6 +11424,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
+         }
+     }
++    // LOCAL (not for upstream): prefill-size matmuls at the house model's shapes for the SYCL dq-gemm path: full
++    // 2048-token ubatches, a ragged tail (700) and 512. MUL_MAT = a fresh weight (SYCL: the plain-layout dequantize
++    // unless dq-gemm installs the reorder); MUL_MAT_PREFILL = the same op after one untimed decode step on the weight
++    // (reorder layout, as the seat runs it). f16 weights for the GEMM-only reference.
++    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120},
++                                                         {12288, 5120}, {5120, 6144} }) {
++        for (int nc : { 512, 700, 2048 }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++            test_cases.emplace_back(new test_mul_mat_prefill(GGML_TYPE_Q4_K, nw, nc, kw));
++            if ((nw == 5120 && kw == 17408) || (nw == 10240 && kw == 5120)) {
++                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++                test_cases.emplace_back(new test_mul_mat_prefill(GGML_TYPE_Q6_K, nw, nc, kw));
++            }
++            if (nw == 17408 || (nw == 5120 && kw == 17408)) {
++                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++            }
++        }
++    }
++    // LOCAL: short prefill ubatches / prompt tails, for tuning GGML_SYCL_DQ_GEMM_MIN_COLS
++    for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408} }) {
++        for (int nc : { 17, 32, 48, 64, 128, 256, 300, 1024, 1280, 1536, 1792 }) {
++            test_cases.emplace_back(new test_mul_mat_prefill(GGML_TYPE_Q4_K, nw, nc, kw));
++        }
++    }
+ 
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here

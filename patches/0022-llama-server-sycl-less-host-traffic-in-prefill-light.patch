@@ -1,0 +1,1377 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Mon, 28 Sep 2026 05:10:01 -0600
+Subject: [PATCH 22/27] llama/server/sycl : less host traffic in prefill,
+ lighter checkpoints
+
+Exact host-side changes for prefill with an MTP draft context, behind
+env switches (default off):
+- LLAMA_MTP_H_DEVICE: the MTP hidden-state rows stay on the device
+  instead of a download and re-upload per ubatch
+- LLAMA_KQ_MASK_HINT_NOFILL: skip the host fill of a tagged causal mask
+- LLAMA_KV_CKPT_PARTIAL_SKIP: a draft context checkpoint no longer
+  copies the whole draft KV; the tail is trimmed with seq_rm
+- LLAMA_CKPT_POOL: reuse checkpoint buffers
+Diagnostics: GGML_SYCL_FA_STATS (kernel and mask-tag counters; =2
+re-runs every causal attention call on the explicit-mask path and
+compares bit for bit), GGML_SYCL_GPU_TIMELINE, more LLAMA_HOST_PROF
+keys, PPL_STREAM=1 for llama-perplexity.
+
+Assisted-by: Claude Opus 5.5
+---
+ common/common.cpp                   | 125 +++++++++++++++++++++-
+ common/common.h                     |  11 ++
+ common/speculative.cpp              |  41 +++++++-
+ ggml/src/ggml-backend.cpp           |  33 ++++++
+ ggml/src/ggml-sycl/fattn-onednn.cpp | 155 +++++++++++++++++++++++-----
+ ggml/src/ggml-sycl/fattn-onednn.hpp |  29 ++++++
+ ggml/src/ggml-sycl/fattn.cpp        |  20 ++++
+ ggml/src/ggml-sycl/ggml-sycl.cpp    |  81 +++++++++++++++
+ src/llama-context.cpp               | 115 ++++++++++++++++++++-
+ src/llama-context.h                 |  11 ++
+ src/llama-cparams.h                 |   9 ++
+ src/llama-ext.h                     |  10 ++
+ src/llama-kv-cache.cpp              |  82 ++++++++++++++-
+ src/models/qwen35.cpp               |   7 ++
+ tools/perplexity/perplexity.cpp     |  68 ++++++++++--
+ tools/server/server-context.cpp     |  16 +++
+ 16 files changed, 768 insertions(+), 45 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index d8319cd9ac..d268cfd42d 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -3,6 +3,8 @@
+ 
+ #include "build-info.h"
+ #include "common.h"
++
++#include <mutex>
+ #include "fit.h"
+ #include "log.h"
+ #include "llama.h"
+@@ -2251,6 +2253,113 @@ bool common_prompt_batch_decode(
+     return true;
+ }
+ 
++// ---- [prefill2] LLAMA_CKPT_POOL: reuse of checkpoint state buffers (see common.h) ----
++static bool common_ckpt_pool_on() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_CKPT_POOL");
++        return e && atoi(e) != 0;
++    }();
++    return v;
++}
++
++// never destroyed: checkpoints may still be released during static destruction at exit
++static std::mutex &                        g_ckpt_pool_mtx   = *new std::mutex();
++static std::vector<std::vector<uint8_t>> & g_ckpt_pool       = *new std::vector<std::vector<uint8_t>>();
++static size_t                              g_ckpt_pool_bytes = 0;
++static constexpr size_t COMMON_CKPT_POOL_MAX_BUFS  = 12;
++static constexpr size_t COMMON_CKPT_POOL_MAX_BYTES = 2ull << 30;
++static constexpr size_t COMMON_CKPT_POOL_MIN_BYTES = 1ull << 20;
++
++// hand a buffer that is no longer needed to the pool (dropped when the pool is full)
++static void common_ckpt_pool_give(std::vector<uint8_t> & v) {
++    if (!common_ckpt_pool_on() || v.capacity() < COMMON_CKPT_POOL_MIN_BYTES) {
++        return;
++    }
++    std::lock_guard<std::mutex> lk(g_ckpt_pool_mtx);
++    if (g_ckpt_pool.size() >= COMMON_CKPT_POOL_MAX_BUFS || g_ckpt_pool_bytes + v.capacity() > COMMON_CKPT_POOL_MAX_BYTES) {
++        return;
++    }
++    g_ckpt_pool_bytes += v.capacity();
++    g_ckpt_pool.emplace_back();
++    g_ckpt_pool.back().swap(v);
++}
++
++// size v to n bytes, reusing a pooled buffer of the same size when v has no room (contents are overwritten by the caller)
++static void common_ckpt_pool_resize(std::vector<uint8_t> & v, size_t n) {
++    if (common_ckpt_pool_on() && v.capacity() < n && n >= COMMON_CKPT_POOL_MIN_BYTES) {
++        std::lock_guard<std::mutex> lk(g_ckpt_pool_mtx);
++        size_t best = SIZE_MAX;
++        for (size_t i = 0; i < g_ckpt_pool.size(); ++i) {
++            // an exactly sized buffer (the recurrent state has one fixed size), else the smallest that holds n and has
++            // n bytes already constructed (no zero fill of a tail)
++            if (g_ckpt_pool[i].size() >= n && (best == SIZE_MAX || g_ckpt_pool[i].size() < g_ckpt_pool[best].size())) {
++                best = i;
++            }
++        }
++        if (best != SIZE_MAX && g_ckpt_pool[best].size() <= 2 * n) {
++            std::vector<uint8_t> old;
++            old.swap(v);
++            v.swap(g_ckpt_pool[best]);
++            g_ckpt_pool_bytes -= v.capacity();
++            g_ckpt_pool.erase(g_ckpt_pool.begin() + best);
++            // the replaced (smaller) buffer is simply freed
++        }
++    }
++    v.resize(n);
++}
++
++common_prompt_checkpoint::common_prompt_checkpoint(const common_prompt_checkpoint & other)
++    : n_tokens(other.n_tokens), id_task(other.id_task), pos_min(other.pos_min), pos_max(other.pos_max),
++      data_spec(other.data_spec) {
++    common_ckpt_pool_resize(data_tgt, other.data_tgt.size());
++    if (!other.data_tgt.empty()) {
++        memcpy(data_tgt.data(), other.data_tgt.data(), other.data_tgt.size());
++    }
++    common_ckpt_pool_resize(data_dft, other.data_dft.size());
++    if (!other.data_dft.empty()) {
++        memcpy(data_dft.data(), other.data_dft.data(), other.data_dft.size());
++    }
++}
++
++common_prompt_checkpoint & common_prompt_checkpoint::operator=(const common_prompt_checkpoint & other) {
++    if (this != &other) {
++        n_tokens  = other.n_tokens;
++        id_task   = other.id_task;
++        pos_min   = other.pos_min;
++        pos_max   = other.pos_max;
++        data_spec = other.data_spec;
++        common_ckpt_pool_resize(data_tgt, other.data_tgt.size());
++        if (!other.data_tgt.empty()) {
++            memcpy(data_tgt.data(), other.data_tgt.data(), other.data_tgt.size());
++        }
++        common_ckpt_pool_resize(data_dft, other.data_dft.size());
++        if (!other.data_dft.empty()) {
++            memcpy(data_dft.data(), other.data_dft.data(), other.data_dft.size());
++        }
++    }
++    return *this;
++}
++
++common_prompt_checkpoint & common_prompt_checkpoint::operator=(common_prompt_checkpoint && other) noexcept {
++    if (this != &other) {
++        common_ckpt_pool_give(data_tgt);
++        common_ckpt_pool_give(data_dft);
++        n_tokens  = other.n_tokens;
++        id_task   = other.id_task;
++        pos_min   = other.pos_min;
++        pos_max   = other.pos_max;
++        data_tgt  = std::move(other.data_tgt);
++        data_dft  = std::move(other.data_dft);
++        data_spec = std::move(other.data_spec);
++    }
++    return *this;
++}
++
++common_prompt_checkpoint::~common_prompt_checkpoint() {
++    common_ckpt_pool_give(data_tgt);
++    common_ckpt_pool_give(data_dft);
++}
++
+ size_t common_prompt_checkpoint::size() const {
+     return data_tgt.size() + data_dft.size() + data_spec.size();
+ }
+@@ -2287,11 +2396,23 @@ void common_prompt_checkpoint::update_tgt(
+         return;
+     }
+ 
++    // [prefill2] LLAMA_HOST_PROF: sync / size / alloc / copy split of a checkpoint
++    const bool hp = llama_hprof_enabled();
++    int64_t t0 = hp ? ggml_time_us() : 0;
++    if (hp) {
++        llama_synchronize(ctx);
++        llama_hprof_record("ckpt.tgt.sync", t0);
++        t0 = ggml_time_us();
++    }
++
+     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
++    if (hp) { llama_hprof_record("ckpt.tgt.size", t0); t0 = ggml_time_us(); }
+ 
+-    data_tgt.resize(ckpt_size);
++    common_ckpt_pool_resize(data_tgt, ckpt_size);
++    if (hp) { llama_hprof_record("ckpt.tgt.resize", t0); t0 = ggml_time_us(); }
+ 
+     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
++    if (hp) { llama_hprof_record("ckpt.tgt.get_data", t0); }
+     if (n != ckpt_size) {
+         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+     }
+@@ -2307,7 +2428,7 @@ void common_prompt_checkpoint::update_dft(
+ 
+     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+ 
+-    data_dft.resize(ckpt_size);
++    common_ckpt_pool_resize(data_dft, ckpt_size);
+ 
+     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+     if (n != ckpt_size) {
+diff --git a/common/common.h b/common/common.h
+index 62d63bd754..eea8397110 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1165,6 +1165,17 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
+ //
+ 
+ struct common_prompt_checkpoint {
++    // [prefill2] env LLAMA_CKPT_POOL=1 (default 0): the state buffers of destroyed / overwritten checkpoints are kept in a
++    // small pool (at most 12 buffers, 2 GiB) and reused by new checkpoints and by copies of checkpoints. A fresh 150 MiB
++    // std::vector costs ~100 ms in the server (page faults + zero fill) against ~10 ms to overwrite a reused one; the
++    // recurrent-state part of every checkpoint has the same size. Contents are always fully overwritten: same bytes.
++    common_prompt_checkpoint() = default;
++    common_prompt_checkpoint(const common_prompt_checkpoint & other);
++    common_prompt_checkpoint(common_prompt_checkpoint && other) noexcept = default;
++    common_prompt_checkpoint & operator=(const common_prompt_checkpoint & other);
++    common_prompt_checkpoint & operator=(common_prompt_checkpoint && other) noexcept;
++    ~common_prompt_checkpoint();
++
+     int64_t n_tokens;
+ 
+     // (optional) id of the task that created the checkpoint
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index b97dc756af..41b93077b7 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1425,6 +1425,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     // round (only the rows below pos0, i.e. the accepted ones), or flushed at the next process() call.
+     // Saves one draft-context graph (build + submit + launch overhead) per speculative step.
+     bool defer_catchup = false;
++
++    // [prefill2] LLAMA_MTP_H_DEVICE=1 (default 0): prompt batches (> 16 tokens, one sequence) hand the target's h rows
++    // to the draft on the device (llama_mtp_h_dev_*, llama-ext.h) instead of D2H + 3 host copies + H2D per ubatch
++    bool h_dev = false;
+     struct deferred_rows_t {
+         std::vector<llama_token> tok;
+         std::vector<llama_pos>   pos;
+@@ -1550,6 +1554,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             deferred.assign(n_seq, {});
+             SPC_TRC("- defer_catchup=%d\n", (int) defer_catchup);
+         }
++        {
++            const char * e = getenv("LLAMA_MTP_H_DEVICE");
++            if (e && atoi(e) != 0 && !is_mem_shared && !chain_heads && !defer_catchup &&
++                llama_n_batch(ctx_dft) <= llama_n_batch(ctx_tgt)) {
++                h_dev = llama_mtp_h_dev_link(ctx_tgt, ctx_dft);
++            }
++            SPC_TRC("- h_dev=%d\n", (int) h_dev);
++        }
+     }
+ 
+     ~common_speculative_impl_draft_mtp() override {
+@@ -1682,6 +1694,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+         const int64_t hp_prep_t0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [hostv] mtp.catchup_prep
++        // [prefill2] LLAMA_MTP_H_DEVICE: the h rows of this batch are on the device (same test as the target's decode)
++        const bool use_h_dev = h_dev && !is_mem_shared && llama_mtp_h_dev_batch_ok(ctx_tgt, &batch_in);
++        const llama_seq_id h_dev_seq = use_h_dev ? batch_in.seq_id[0][0] : -1;
+         if (!is_mem_shared) {
+             common_batch_clear(batch);
+ 
+@@ -1694,7 +1709,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+             //                                                       ^--- this is a problem
+             // TODO:this is generally true, but would be nice to assert it
+-            {
++            if (!use_h_dev) {
+                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+             }
+@@ -1704,7 +1719,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+             };
+ 
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq && !use_h_dev; ++seq_id) {
+                 if (i_batch_beg[seq_id] < 0) {
+                     continue;
+                 }
+@@ -1742,7 +1757,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     llama_hprof_record("mtp.catchup_prep", hp_prep_t0);
+                 }
+                 const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0;
+-                const int32_t rc = llama_decode(ctx_dft, batch);
++                int32_t rc;
++                if (use_h_dev) {
++                    // device row 0 = the pending row, rows 1.. = the target's h rows of this batch
++                    llama_mtp_h_dev_begin(ctx_dft, pending_h[h_dev_seq].data());
++                    llama_batch b = batch;
++                    b.embd = nullptr;
++                    rc = llama_decode(ctx_dft, b);
++                    llama_mtp_h_dev_end(ctx_dft);
++                } else {
++                    rc = llama_decode(ctx_dft, batch);
++                }
+                 if (hp_t0) {
+                     llama_hprof_record(batch.n_tokens <= 16 ? "mtp.catchup_decode_call" : "mtp.catchup_decode_call.pp", hp_t0);
+                 }
+@@ -1770,6 +1795,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 continue;
+             }
+ 
++            if (use_h_dev) {
++                // only the last row is on the host (the carry-over for the next batch); a prompt batch is never
++                // followed by accept(), which reads verify rows of verification batches only
++                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]);
++                verify_h_rows[seq_id] = 1;
++                verify_h[seq_id].assign(h, h + n_embd);
++                std::memcpy(pending_h[seq_id].data(), h, row_bytes);
++                continue;
++            }
++
+             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+             verify_h_rows[seq_id] = n_rows;
+             verify_h[seq_id].resize((size_t) n_rows * n_embd);
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 5bd4190bcf..d1eb467891 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1798,6 +1798,35 @@ static bool ggml_sched_prof_on() {
+     return on;
+ }
+ 
++// [prefill2] GGML_SYCL_FA_STATS=1 (LOCAL, default 0): hinted KQ-mask inputs whose upload the scheduler skipped / still
++// uploaded, printed to stderr at exit and at powers of two
++static int64_t g_sched_mask_st[2] = {}, g_sched_mask_bytes[2] = {};
++static void ggml_sched_mask_stats_print() {
++    fprintf(stderr, "[sched-mask-stats] hinted mask inputs: upload_skipped=%lld (%.1f MB) uploaded=%lld (%.1f MB)\n",
++            (long long) g_sched_mask_st[0], g_sched_mask_bytes[0] / 1e6, (long long) g_sched_mask_st[1],
++            g_sched_mask_bytes[1] / 1e6);
++    fflush(stderr);
++}
++static void ggml_sched_mask_stats_add(int i, size_t bytes) {
++    static const bool on = [] {
++        const char * e = getenv("GGML_SYCL_FA_STATS");
++        const bool v = e && atoi(e) > 0;
++        if (v) {
++            atexit(ggml_sched_mask_stats_print);
++        }
++        return v;
++    }();
++    if (!on) {
++        return;
++    }
++    g_sched_mask_st[i]++;
++    g_sched_mask_bytes[i] += (int64_t) bytes;
++    const int64_t n = g_sched_mask_st[0] + g_sched_mask_st[1];
++    if (n >= 8 && (n & (n - 1)) == 0) {
++        ggml_sched_mask_stats_print();
++    }
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1862,8 +1891,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 if (input->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL && input->op_params[3] == 1 &&
+                     input->type == GGML_TYPE_F16 &&
+                     ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    ggml_sched_mask_stats_add(0, ggml_nbytes(input));
+                     continue;
+                 }
++                if (input->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL) {
++                    ggml_sched_mask_stats_add(1, ggml_nbytes(input));
++                }
+             }
+ 
+             if (st_beg != SIZE_MAX && ggml_sched_input_stageable(input, input_cpy)) {
+diff --git a/ggml/src/ggml-sycl/fattn-onednn.cpp b/ggml/src/ggml-sycl/fattn-onednn.cpp
+index 2e5d501e7b..0c854a32d2 100644
+--- a/ggml/src/ggml-sycl/fattn-onednn.cpp
++++ b/ggml/src/ggml-sycl/fattn-onednn.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include <array>
+ #include <chrono>
+ #include <cmath>
+@@ -115,10 +116,65 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst, bool use
+ #endif
+ }
+ 
++// ---- LOCAL (prefill2) GGML_SYCL_FA_STATS ----
++static int64_t g_fa_stats[FA_ST_COUNT] = {};
++static double  g_fa_stats_maxdiff = 0.0;
++
++static void ggml_sycl_fa_stats_print() {
++    const int64_t * s = g_fa_stats;
++    fprintf(stderr,
++            "[fa-stats] calls=%lld kernel: onednn=%lld xmx=%lld tile=%lld vec=%lld mkl=%lld | mask: none=%lld untagged=%lld "
++            "tagged=%lld not_uploaded=%lld | onednn: causal=%lld explicit_tagged=%lld explicit_untagged=%lld "
++            "causal_nofuse=%lld fallback_tile=%lld fallback_exc=%lld regen=%lld",
++            (long long) s[FA_ST_CALLS], (long long) s[FA_ST_K_ONEDNN], (long long) s[FA_ST_K_XMX],
++            (long long) s[FA_ST_K_TILE], (long long) s[FA_ST_K_VEC], (long long) s[FA_ST_K_MKL],
++            (long long) s[FA_ST_MASK_NONE], (long long) s[FA_ST_MASK_UNTAGGED], (long long) s[FA_ST_MASK_TAGGED],
++            (long long) s[FA_ST_MASK_NOTUPLOADED], (long long) s[FA_ST_CAUSAL], (long long) s[FA_ST_EXPL_TAGGED],
++            (long long) s[FA_ST_EXPL_UNTAGGED], (long long) s[FA_ST_CAUSAL_NOFUSE], (long long) s[FA_ST_FALLBACK_TILE],
++            (long long) s[FA_ST_FALLBACK_EXC], (long long) s[FA_ST_REGEN]);
++    if (s[FA_ST_CMP_CALLS] > 0) {
++        fprintf(stderr, " | compare: calls=%lld calls_differing=%lld values_differing=%lld/%lld max_abs_diff=%.6g",
++                (long long) s[FA_ST_CMP_CALLS], (long long) s[FA_ST_CMP_DIFF_CALLS],
++                (long long) s[FA_ST_CMP_DIFF_VALUES], (long long) s[FA_ST_CMP_VALUES], g_fa_stats_maxdiff);
++    }
++    fprintf(stderr, "\n");
++    fflush(stderr);
++}
++
++int ggml_sycl_fa_stats_mode() {
++    static const int mode = [] {
++        const char * e = getenv("GGML_SYCL_FA_STATS");
++        const int m = e ? atoi(e) : 0;
++        if (m > 0) {
++            atexit(ggml_sycl_fa_stats_print);
++        }
++        return m;
++    }();
++    return mode;
++}
++
++void ggml_sycl_fa_stat(ggml_sycl_fa_stat_id id, int64_t n) {
++    g_fa_stats[id] += n;
++}
++
++void ggml_sycl_fa_stat_maxdiff(double d) {
++    g_fa_stats_maxdiff = std::max(g_fa_stats_maxdiff, d);
++}
++
++void ggml_sycl_fa_stats_tick() {
++    const int64_t n = g_fa_stats[FA_ST_CALLS];
++    if (n >= 16 && (n & (n - 1)) == 0) {
++        ggml_sycl_fa_stats_print();
++    }
++}
++
+ void ggml_sycl_fa_mask_ensure(ggml_backend_sycl_context & ctx, const ggml_tensor * mask_c) {
+     if (!mask_c || mask_c->op_params[0] != GGML_KQ_MASK_HINT_CAUSAL || mask_c->op_params[3] != 1) {
+         return;
+     }
++    if (ggml_sycl_fa_stats_mode() > 0) {
++        ggml_sycl_fa_stat(FA_ST_REGEN);
++    }
+     // test hook (negative control of the GGML_SYCL_FA_MASK_POISON test): PX_NO_ENSURE=1 skips the rebuild
+     static const bool no_ensure = getenv("PX_NO_ENSURE") != nullptr;
+     if (no_ensure) {
+@@ -527,11 +583,15 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
+     // pointers and strides stay those of the n_kv-cell tensors; only the sequence dimension shrinks), else the
+     // explicit-mask partition over all n_kv cells
+     const int64_t n_used = ggml_sycl_fa_causal_n_used(mask, q, seq);
++    const int     st_mode = ggml_sycl_fa_stats_mode();
++    const bool    tagged  = mask && mask->op_params[0] == GGML_KQ_MASK_HINT_CAUSAL;
+     sdpa_partition * Ep = nullptr;
+     if (n_used > 0) {
+         sdpa_partition & Ec = get_partition(n_used, true);
+         if (Ec.ok) {
+             Ep = &Ec;
++        } else if (st_mode > 0) {
++            ggml_sycl_fa_stat(FA_ST_CAUSAL_NOFUSE);
+         }
+     }
+     if (Ep == nullptr) {
+@@ -541,37 +601,81 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
+     sdpa_partition & E = *Ep;
+     if (!E.ok) {
+         // oneDNN can decline a shape or a stride set that _supported() never sees; build_sdpa warns per key.
++        if (st_mode > 0) {
++            ggml_sycl_fa_stat(FA_ST_FALLBACK_TILE);
++        }
++        ggml_sycl_fa_mask_ensure(ctx, mask);
+         ggml_sycl_flash_attn_ext_tile(ctx, dst);
+         return;
+     }
++    if (st_mode > 0) {
++        ggml_sycl_fa_stat(E.id_kvlen != SIZE_MAX ? FA_ST_CAUSAL : tagged ? FA_ST_EXPL_TAGGED : FA_ST_EXPL_UNTAGGED);
++    }
+ 
+-    auto id2ptr = [&](size_t r) -> void * {
+-        if (r == E.id_q)     return Qf_ptr;
+-        if (r == E.id_k)     return K_ptr;
+-        if (r == E.id_v)     return V_ptr;
+-        if (r == E.id_scale) return scale_dev;
+-        if (r == E.id_mask)  return (void *) mask->data;
+-        return nullptr;
++    auto run_partition = [&](sdpa_partition & P, sycl::half * out_ptr) {
++        auto id2ptr = [&](size_t r) -> void * {
++            if (r == P.id_q)     return Qf_ptr;
++            if (r == P.id_k)     return K_ptr;
++            if (r == P.id_v)     return V_ptr;
++            if (r == P.id_scale) return scale_dev;
++            if (r == P.id_mask)  return (void *) mask->data;
++            return nullptr;
++        };
++        std::vector<tensor> ti;
++        ti.reserve(P.ins.size());
++        int32_t kvlen_v = (int32_t) n_used;
++        int32_t qlen_v  = (int32_t) q;
++        float   ninf_v  = -INFINITY;
++        for (auto & lt : P.ins) {
++            const size_t lid = lt.get_id();
++            if (lid == P.id_kvlen) {
++                ti.push_back(tensor::make_scalar_tensor(lt, &kvlen_v));
++            } else if (lid == P.id_qlen) {
++                ti.push_back(tensor::make_scalar_tensor(lt, &qlen_v));
++            } else if (lid == P.id_ninf) {
++                ti.push_back(tensor::make_scalar_tensor(lt, &ninf_v));
++            } else {
++                ti.emplace_back(lt, eng, id2ptr(lid));
++            }
++        }
++        tensor to(P.out, eng, out_ptr);
++        P.cp.execute(strm, ti, {to});
+     };
+-    std::vector<tensor> ti;
+-    ti.reserve(E.ins.size());
+-    int32_t kvlen_v = (int32_t) n_used;
+-    int32_t qlen_v  = (int32_t) q;
+-    float   ninf_v  = -INFINITY;
+-    for (auto & lt : E.ins) {
+-        const size_t lid = lt.get_id();
+-        if (lid == E.id_kvlen) {
+-            ti.push_back(tensor::make_scalar_tensor(lt, &kvlen_v));
+-        } else if (lid == E.id_qlen) {
+-            ti.push_back(tensor::make_scalar_tensor(lt, &qlen_v));
+-        } else if (lid == E.id_ninf) {
+-            ti.push_back(tensor::make_scalar_tensor(lt, &ninf_v));
+-        } else {
+-            ti.emplace_back(lt, eng, id2ptr(lid));
++    run_partition(E, outf_ptr);
++
++    // LOCAL (prefill2) GGML_SYCL_FA_STATS=2: rerun the explicit-mask partition over all n_kv cells and compare the f16
++    // SDPA outputs bit for bit (test mode; host-synchronous, never while a SYCL graph is being recorded)
++    if (st_mode >= 2 && E.id_kvlen != SIZE_MAX && !g_ggml_sycl_graph_recording) {
++        ggml_sycl_fa_mask_ensure(ctx, mask);
++        sdpa_partition & X = get_partition(seq, false);
++        if (X.ok) {
++            const size_t nv = (size_t) H * q * d;
++            ggml_sycl_pool_alloc<sycl::half> ref(ctx.pool(), nv);
++            run_partition(X, ref.get());
++            std::vector<sycl::half> a(nv), b(nv);
++            stream->memcpy(a.data(), outf_ptr, nv * sizeof(sycl::half));
++            stream->memcpy(b.data(), ref.get(), nv * sizeof(sycl::half));
++            stream->wait_and_throw();
++            int64_t ndiff = 0;
++            double  maxd  = 0.0;
++            for (size_t i = 0; i < nv; ++i) {
++                uint16_t ua, ub;
++                memcpy(&ua, &a[i], 2);
++                memcpy(&ub, &b[i], 2);
++                if (ua != ub) {
++                    ndiff++;
++                    maxd = std::max(maxd, (double) std::fabs((float) a[i] - (float) b[i]));
++                }
++            }
++            ggml_sycl_fa_stat(FA_ST_CMP_CALLS);
++            ggml_sycl_fa_stat(FA_ST_CMP_VALUES, (int64_t) nv);
++            if (ndiff) {
++                ggml_sycl_fa_stat(FA_ST_CMP_DIFF_CALLS);
++                ggml_sycl_fa_stat(FA_ST_CMP_DIFF_VALUES, ndiff);
++                ggml_sycl_fa_stat_maxdiff(maxd);
++            }
+         }
+     }
+-    tensor to(E.out, eng, outf_ptr);
+-    E.cp.execute(strm, ti, {to});
+ 
+     permute_sdpa_out_sycl(outf_ptr, (float *) dst->data, mb, H, q, d, stream);
+     // Single device needs no sync: the dnnl stream wraps this same in-order queue, so the SDPA
+@@ -591,6 +695,9 @@ catch (const std::exception & e) {
+     }
+     // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).
+     GGML_LOG_WARN("%s: oneDNN SDPA failed (%s); falling back to TILE kernel\n", __func__, e.what());
++    if (ggml_sycl_fa_stats_mode() > 0) {
++        ggml_sycl_fa_stat(FA_ST_FALLBACK_EXC);
++    }
+     ggml_sycl_fa_mask_ensure(ctx, dst->src[3]);
+     ggml_sycl_flash_attn_ext_tile(ctx, dst);
+ }
+diff --git a/ggml/src/ggml-sycl/fattn-onednn.hpp b/ggml/src/ggml-sycl/fattn-onednn.hpp
+index d3ee552e76..1e045f6dae 100644
+--- a/ggml/src/ggml-sycl/fattn-onednn.hpp
++++ b/ggml/src/ggml-sycl/fattn-onednn.hpp
+@@ -20,4 +20,33 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
+ // (op_params[3] = 2 afterwards). No-op for any other mask.
+ void ggml_sycl_fa_mask_ensure(ggml_backend_sycl_context & ctx, const ggml_tensor * mask);
+ 
++// LOCAL (prefill2) GGML_SYCL_FA_STATS=1 (default 0): per-process counters of the flash-attention dispatch and of the
++// KQ-mask hint as the SYCL backend sees it, printed to stderr at exit and whenever the call count reaches a power of
++// two (>= 16). =2 additionally runs the explicit-mask oneDNN partition after every implicit-causal call and compares
++// the two f16 outputs bit for bit (test mode, synchronous, slow).
++enum ggml_sycl_fa_stat_id {
++    FA_ST_CALLS = 0,          // FLASH_ATTN_EXT calls
++    FA_ST_K_ONEDNN, FA_ST_K_XMX, FA_ST_K_TILE, FA_ST_K_VEC, FA_ST_K_MKL,   // kernel picked by the dispatcher
++    FA_ST_MASK_NONE,          // no mask
++    FA_ST_MASK_UNTAGGED,      // mask without the causal hint
++    FA_ST_MASK_TAGGED,        // mask with the causal hint (uploaded)
++    FA_ST_MASK_NOTUPLOADED,   // hinted mask whose upload the scheduler skipped (op_params[3] 1 or 2 at entry)
++    FA_ST_CAUSAL,             // oneDNN implicit-causal partition executed
++    FA_ST_EXPL_TAGGED,        // oneDNN explicit-mask partition although the mask carried the hint
++    FA_ST_EXPL_UNTAGGED,      // oneDNN explicit-mask partition, mask untagged
++    FA_ST_CAUSAL_NOFUSE,      // causal partition declined by oneDNN (fell back to explicit)
++    FA_ST_FALLBACK_TILE,      // oneDNN partition not ok -> TILE
++    FA_ST_FALLBACK_EXC,       // oneDNN exception -> TILE
++    FA_ST_REGEN,              // not-uploaded mask regenerated on the device
++    FA_ST_CMP_CALLS,          // =2: causal calls compared against the explicit partition
++    FA_ST_CMP_DIFF_CALLS,     // =2: ... with at least one output value differing in its bits
++    FA_ST_CMP_DIFF_VALUES,    // =2: total differing values
++    FA_ST_CMP_VALUES,         // =2: total compared values
++    FA_ST_COUNT
++};
++int  ggml_sycl_fa_stats_mode();
++void ggml_sycl_fa_stat(ggml_sycl_fa_stat_id id, int64_t n = 1);
++void ggml_sycl_fa_stat_maxdiff(double d);
++void ggml_sycl_fa_stats_tick();   // after a call: periodic print
++
+ #endif // GGML_SYCL_FATTN_ONEDNN_HPP
+diff --git a/ggml/src/ggml-sycl/fattn.cpp b/ggml/src/ggml-sycl/fattn.cpp
+index 364ec7892b..5b0d29e969 100644
+--- a/ggml/src/ggml-sycl/fattn.cpp
++++ b/ggml/src/ggml-sycl/fattn.cpp
+@@ -326,6 +326,23 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
+     }
+     // LOCAL (prefillx): a hinted mask that was not uploaded is rebuilt on the device for every kernel that reads it
+     // (the oneDNN path decides for itself: its implicit-causal partition does not read the mask)
++    // LOCAL (prefill2) GGML_SYCL_FA_STATS: dispatch + mask-hint counters
++    const bool fa_st = ggml_sycl_fa_stats_mode() > 0;
++    if (fa_st) {
++        const ggml_tensor * m = dst->src[3];
++        ggml_sycl_fa_stat(FA_ST_CALLS);
++        ggml_sycl_fa_stat(fk == BEST_FATTN_KERNEL_ONEDNN ? FA_ST_K_ONEDNN : fk == BEST_FATTN_KERNEL_XMX ? FA_ST_K_XMX :
++                          fk == BEST_FATTN_KERNEL_VEC ? FA_ST_K_VEC : fk == BEST_FATTN_KERNEL_MKL ? FA_ST_K_MKL : FA_ST_K_TILE);
++        if (!m) {
++            ggml_sycl_fa_stat(FA_ST_MASK_NONE);
++        } else if (m->op_params[0] != GGML_KQ_MASK_HINT_CAUSAL) {
++            ggml_sycl_fa_stat(FA_ST_MASK_UNTAGGED);
++        } else if (m->op_params[3] == 1 || m->op_params[3] == 2) {
++            ggml_sycl_fa_stat(FA_ST_MASK_NOTUPLOADED);
++        } else {
++            ggml_sycl_fa_stat(FA_ST_MASK_TAGGED);
++        }
++    }
+     if (fk != BEST_FATTN_KERNEL_ONEDNN) {
+         ggml_sycl_fa_mask_ensure(ctx, dst->src[3]);
+     }
+@@ -352,6 +369,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
+             ggml_sycl_fattn_xmx(ctx, dst);
+             break;
+     }
++    if (fa_st) {
++        ggml_sycl_fa_stats_tick();
++    }
+ 
+     // --- Output fingerprint (GGML_SYCL_MKL_FA_DIAG=1) ---
+     // Copy first 64 float output values to host for fingerprinting.
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 0c3df94534..d05805334c 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6978,7 +6978,88 @@ static int ggml_sycl_gtime_mode() {
+ 
+ static ggml_status ggml_backend_sycl_graph_compute_timed(ggml_backend_t backend, ggml_cgraph * cgraph);
+ 
++// ---- LOCAL (prefill2) GGML_SYCL_GPU_TIMELINE=N (default 0): non-blocking GPU timeline of prefill-size graphs
++//      (first MUL_MAT with > 16 rows). After each such graph a SYCL host_task is queued (in-order queue: it runs when the
++//      graph's device work is done) and records the completion time. Per graph kind (n_nodes, n_tokens):
++//        submit = host time spent enqueueing the graph,
++//        gap    = enqueue start - completion of the previous marked graph (> 0: the device had nothing of ours queued
++//                 from the previous prefill graph's end until this graph was enqueued, except unmarked copies/graphs),
++//        busy   = completion - max(enqueue start, previous completion) (device time of this graph incl. anything queued
++//                 in between, e.g. the h_nextn D2H copy after the previous graph).
++//      Prints every N marked graphs and at exit. Adds one host round trip (~tens of us) per prefill graph.
++struct ggml_sycl_tl_acc { int64_t n = 0; double submit = 0, gap = 0, busy = 0, gap_max = 0; };
++static std::mutex g_sycl_tl_mtx;
++static std::map<std::pair<int, int64_t>, ggml_sycl_tl_acc> g_sycl_tl;
++static double  g_sycl_tl_last_done = -1.0;   // ms, steady clock
++static int64_t g_sycl_tl_count = 0;
++static double ggml_sycl_tl_now_ms() {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++static void ggml_sycl_tl_print_locked() {
++    for (auto & kv : g_sycl_tl) {
++        const auto & a = kv.second;
++        if (a.n == 0) continue;
++        fprintf(stderr, "[gpu-timeline] n_nodes=%5d n_tokens=%5lld graphs=%6lld submit=%.3f gap=%.3f (max %.1f) busy=%.3f ms/graph | totals gap=%.1f busy=%.1f ms\n",
++                kv.first.first, (long long) kv.first.second, (long long) a.n, a.submit / a.n, a.gap / a.n, a.gap_max,
++                a.busy / a.n, a.gap, a.busy);
++    }
++    fflush(stderr);
++}
++static void ggml_sycl_tl_print() {
++    std::lock_guard<std::mutex> lk(g_sycl_tl_mtx);
++    ggml_sycl_tl_print_locked();
++}
++static int ggml_sycl_tl_mode() {
++    static int every = -1;
++    if (every < 0) {
++        const char * e = getenv("GGML_SYCL_GPU_TIMELINE");
++        every = e ? std::max(0, atoi(e)) : 0;
++        if (every > 0) std::atexit(ggml_sycl_tl_print);
++    }
++    return every;
++}
++
+ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
++    const int tl_every = ggml_sycl_tl_mode();
++    if (tl_every > 0 && !g_ggml_sycl_graph_recording) {
++        int64_t n_tokens = 0;
++        for (int i = 0; i < cgraph->n_nodes; i++) {
++            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) { n_tokens = cgraph->nodes[i]->ne[1]; break; }
++        }
++        if (n_tokens > 16) {
++            auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
++            const double t_enq0 = ggml_sycl_tl_now_ms();
++            const ggml_status st = ggml_backend_sycl_graph_compute_timed(backend, cgraph);
++            const double t_enq1 = ggml_sycl_tl_now_ms();
++            const std::pair<int, int64_t> key(cgraph->n_nodes, n_tokens);
++            sycl_ctx->stream()->submit([=](sycl::handler & h) {
++                h.host_task([=]() {
++                    const double t_done = ggml_sycl_tl_now_ms();
++                    std::lock_guard<std::mutex> lk(g_sycl_tl_mtx);
++                    auto & a = g_sycl_tl[key];
++                    double prev = g_sycl_tl_last_done;
++                    // a gap of > 1.5 s is idle time between requests: print the finished segment and start a new one
++                    if (prev >= 0 && t_enq0 - prev > 1500.0) {
++                        fprintf(stderr, "[gpu-timeline] ---- segment end (idle %.0f ms) ----\n", t_enq0 - prev);
++                        ggml_sycl_tl_print_locked();
++                        g_sycl_tl.clear();
++                        prev = -1.0;
++                    }
++                    const double gap  = prev < 0 ? 0.0 : std::max(0.0, t_enq0 - prev);
++                    a.n++;
++                    a.submit += t_enq1 - t_enq0;
++                    a.gap    += gap;
++                    a.gap_max = std::max(a.gap_max, gap);
++                    a.busy   += t_done - (prev < 0 ? t_enq0 : std::max(t_enq0, prev));
++                    g_sycl_tl_last_done = t_done;
++                    if (++g_sycl_tl_count % tl_every == 0) {
++                        ggml_sycl_tl_print_locked();
++                    }
++                });
++            });
++            return st;
++        }
++    }
+     const int every = ggml_sycl_gtime_mode();
+     if (every <= 0) {
+         return ggml_backend_sycl_graph_compute_timed(backend, cgraph);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 83f27055f0..b136216bc1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1310,6 +1310,70 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
+     cparams.nextn_layer_offset = offset;
+ }
+ 
++// [prefill2] LLAMA_MTP_H_DEVICE: keep the MTP hidden states on the device during prompt processing. The target's graph
++// copies its h_nextn rows into a device tensor (rows 1 + i), the draft's MTP graph reads its h input from the same tensor
++// (row 0 = the pending row carried over from the previous batch, uploaded by mtp_h_dev_begin). Replaces, for batches
++// accepted by mtp_h_dev_batch_ok: the h_nextn D2H of every row, the host shift copy into the draft batch, the batch
++// allocator's copy, the draft input copy and its H2D upload. Same values: rows are moved, never recomputed.
++bool llama_context::mtp_h_dev_link(llama_context * dft) {
++    if (dft == nullptr || dft == this || !cparams.embeddings_nextn || cparams.embeddings_nextn_masked) {
++        return false;
++    }
++    ggml_backend_buffer_type_t buft = nullptr;
++    for (auto & b : backends) {
++        if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++            buft = ggml_backend_get_default_buffer_type(b.get());
++            break;
++        }
++    }
++    if (buft == nullptr) {
++        return false;
++    }
++    const int64_t n_embd = model.hparams.n_embd_out();
++    const int64_t n_rows = (int64_t) cparams.n_batch + 1;
++    ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
++    mtp_h_ctx.reset(ggml_init(ip));
++    ggml_tensor * t = ggml_new_tensor_2d(mtp_h_ctx.get(), GGML_TYPE_F32, n_embd, n_rows);
++    ggml_set_name(t, "mtp_h_dev");
++    mtp_h_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mtp_h_ctx.get(), buft));
++    if (!mtp_h_buf) {
++        mtp_h_ctx.reset();
++        return false;
++    }
++    cparams.mtp_h_dev           = t;
++    cparams.mtp_h_dev_role      = 1;
++    dft->cparams.mtp_h_dev      = t;
++    dft->cparams.mtp_h_dev_role = 2;
++    LLAMA_LOG_INFO("%s: MTP hidden states kept on the device (%lld x %lld f32, %.1f MiB in %s)\n", __func__,
++            (long long) n_embd, (long long) n_rows, ggml_nbytes(t) / 1048576.0, ggml_backend_buft_name(buft));
++    return true;
++}
++
++bool llama_context::mtp_h_dev_batch_ok(const llama_batch & batch) const {
++    if (cparams.mtp_h_dev_role != 1 || cparams.mtp_h_dev == nullptr || !cparams.embeddings_nextn ||
++        cparams.embeddings_nextn_masked || batch.token == nullptr || batch.embd != nullptr ||
++        batch.n_tokens <= 16 || batch.n_tokens > (int32_t) cparams.n_batch) {
++        return false;
++    }
++    const llama_seq_id s0 = batch.seq_id ? batch.seq_id[0][0] : 0;
++    for (int32_t i = 0; i < batch.n_tokens; ++i) {
++        if ((batch.n_seq_id && batch.n_seq_id[i] != 1) || (batch.seq_id && batch.seq_id[i][0] != s0)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++void llama_context::mtp_h_dev_begin(const float * pending_row) {
++    GGML_ASSERT(cparams.mtp_h_dev_role == 2 && cparams.mtp_h_dev != nullptr);
++    ggml_backend_tensor_set(cparams.mtp_h_dev, pending_row, 0, cparams.mtp_h_dev->nb[1]);
++    mtp_h_dev_active = true;
++}
++
++void llama_context::mtp_h_dev_end() {
++    mtp_h_dev_active = false;
++}
++
+ void llama_context::set_causal_attn(bool value) {
+     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+ 
+@@ -1464,7 +1528,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     bool hp_reused = false;
+ 
+     // [hostv] LLAMA_GRAPH_REUSE_MULTI: small ubatches use the multi-graph cache instead of gf_res_prev
+-    const bool use_gcache = gcache_max > 0 && ubatch.n_tokens <= gcache_max_tokens && !cparams.pipeline_parallel;
++    // [prefill2] a graph that reads / writes the MTP device rows depends on the ubatch's row offset: never reused
++    const bool h_dev_graph = cparams.mtp_h_dev_row0 >= 0;
++    const bool use_gcache = gcache_max > 0 && ubatch.n_tokens <= gcache_max_tokens && !cparams.pipeline_parallel && !h_dev_graph;
+     graph_cache_entry * gce = nullptr;
+     bool gce_hit     = false;
+     bool hp_restored = false;
+@@ -1518,7 +1584,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (use_gcache ? gce_hit : (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams))) {
++    if (use_gcache ? gce_hit : (!graph_reuse_disable && !h_dev_graph && gf_res_prev_active == res && res->can_reuse(gparams))) {
+         hp_reused = true;
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+@@ -1555,13 +1621,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
++        // [prefill2] LLAMA_MTP_H_DEVICE, target: copy this ubatch's h_nextn rows to the device rows 1 + row0 ..
++        if (h_dev_graph && cparams.mtp_h_dev_role == 1) {
++            ggml_tensor * h = res->get_h_nextn();
++            GGML_ASSERT(h != nullptr && h->type == GGML_TYPE_F32 && h->ne[1] == (int64_t) ubatch.n_tokens &&
++                        h->ne[0] == cparams.mtp_h_dev->ne[0]);
++            GGML_ASSERT(1 + cparams.mtp_h_dev_row0 + (int64_t) ubatch.n_tokens <= cparams.mtp_h_dev->ne[1]);
++            ggml_tensor * dst = ggml_view_2d(res->get_ctx(), cparams.mtp_h_dev, h->ne[0], h->ne[1],
++                    cparams.mtp_h_dev->nb[1], (size_t) (1 + cparams.mtp_h_dev_row0) * cparams.mtp_h_dev->nb[1]);
++            ggml_build_forward_expand(gf, ggml_cpy(res->get_ctx(), h, dst));
++        }
++
+         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+             ret = GGML_STATUS_ALLOC_FAILED;
+             return nullptr;
+         }
+ 
+-        gf_res_prev_active = res;
++        gf_res_prev_active = h_dev_graph ? nullptr : res;
+ 
+         if (gce) {
+             gce->snap = graph_cacheable(gf) ? ggml_backend_sched_snapshot_new(sched.get()) : nullptr;
+@@ -2014,9 +2091,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
+ 
++    // [prefill2] LLAMA_MTP_H_DEVICE: this batch's h rows go through the device tensor (target: accepted batch; draft:
++    // between mtp_h_dev_begin/end)
++    const bool h_dev_on = (cparams.mtp_h_dev_role == 1 && mtp_h_dev_batch_ok(batch_inp)) ||
++                          (cparams.mtp_h_dev_role == 2 && mtp_h_dev_active);
++    struct h_dev_reset_t { llama_cparams & c; ~h_dev_reset_t() { c.mtp_h_dev_row0 = -1; } } h_dev_reset { cparams };
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+ 
++        cparams.mtp_h_dev_row0 = h_dev_on ? (int32_t) n_tokens_prev : -1;
++
+         // count the outputs in this ubatch
+         {
+             int32_t n_outputs_new = 0;
+@@ -2186,7 +2271,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+ 
+                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
++                if (h_dev_on && !masked) {
++                    // [prefill2] LLAMA_MTP_H_DEVICE: the rows stay on the device; the host only needs the last one
++                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out + (n_rows - 1)*n_embd,
++                            (n_rows - 1)*n_embd*sizeof(float), n_embd*sizeof(float));
++                } else {
++                    ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
++                }
+             }
+         }
+ 
+@@ -4178,6 +4269,22 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
+     ctx->set_embeddings_layer_inp(lid, value);
+ }
+ 
++bool llama_mtp_h_dev_link(llama_context * ctx_tgt, llama_context * ctx_dft) {
++    return ctx_tgt->mtp_h_dev_link(ctx_dft);
++}
++
++bool llama_mtp_h_dev_batch_ok(const llama_context * ctx_tgt, const llama_batch * batch) {
++    return ctx_tgt->mtp_h_dev_batch_ok(*batch);
++}
++
++void llama_mtp_h_dev_begin(llama_context * ctx_dft, const float * pending_row) {
++    ctx_dft->mtp_h_dev_begin(pending_row);
++}
++
++void llama_mtp_h_dev_end(llama_context * ctx_dft) {
++    ctx_dft->mtp_h_dev_end();
++}
++
+ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
+     ctx->set_nextn_layer_offset(offset);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index a1ee1d6bb5..002378643c 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -117,6 +117,12 @@ struct llama_context {
+     void set_embeddings_nextn(bool value, bool masked);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
++
++    // [prefill2] LLAMA_MTP_H_DEVICE (see llama-ext.h)
++    bool mtp_h_dev_link(llama_context * ctx_dft);
++    bool mtp_h_dev_batch_ok(const llama_batch & batch) const;
++    void mtp_h_dev_begin(const float * pending_row);
++    void mtp_h_dev_end();
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
+ 
+@@ -404,6 +410,11 @@ private:
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
++    // [prefill2] LLAMA_MTP_H_DEVICE: the device tensor for the MTP hidden states (owned by the target context)
++    ggml_context_ptr        mtp_h_ctx;
++    ggml_backend_buffer_ptr mtp_h_buf;
++    bool                    mtp_h_dev_active = false; // draft: the next decode reads h from cparams.mtp_h_dev
++
+     // keep copies of the per-sequence memory on the device
+     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index b592de18c7..77d1427456 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -21,6 +21,15 @@ struct llama_cparams {
+ 
+     int32_t  nextn_layer_offset = 0;
+ 
++    // [prefill2] LLAMA_MTP_H_DEVICE: MTP hidden states kept on the device (see llama_mtp_h_dev_link, llama-ext.h).
++    // mtp_h_dev: [n_embd, n_batch + 1] f32 device tensor shared by the target and the draft context;
++    // mtp_h_dev_role: 1 = target (its graph writes h_nextn rows to mtp_h_dev rows 1 + row0 ..), 2 = draft (its MTP
++    // graph reads the h input from mtp_h_dev rows row0 .. instead of the ubatch embd); mtp_h_dev_row0: row offset of
++    // the current ubatch within the batch, -1 = not active for this ubatch
++    struct ggml_tensor * mtp_h_dev      = nullptr;
++    int32_t              mtp_h_dev_role = 0;
++    int32_t              mtp_h_dev_row0 = -1;
++
+     float rope_freq_base;
+     float rope_freq_scale;
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 92a759b7a0..3bae2fd21d 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -100,6 +100,16 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
+ // chain multiple trained NextN heads. Default 0 (first head).
+ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+ 
++// [prefill2] MTP hidden states kept on the device during prompt processing (common/speculative.cpp, env
++// LLAMA_MTP_H_DEVICE=1). link: allocates the shared [n_embd, n_batch + 1] f32 device tensor in the target context
++// (false: unsupported, nothing changed). batch_ok: the target keeps the h rows of this batch on the device (token batch,
++// > 16 tokens, one sequence); then only the last row of each ubatch is copied to the host. begin/end bracket the draft
++// decode of such a batch (the draft batch has no embd; begin uploads the pending row = device row 0).
++LLAMA_API bool llama_mtp_h_dev_link(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
++LLAMA_API bool llama_mtp_h_dev_batch_ok(const struct llama_context * ctx_tgt, const struct llama_batch * batch);
++LLAMA_API void llama_mtp_h_dev_begin(struct llama_context * ctx_dft, const float * pending_row);
++LLAMA_API void llama_mtp_h_dev_end(struct llama_context * ctx_dft);
++
+ // mirrors:
+ // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 29533daf8f..58968e3920 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1827,6 +1827,47 @@ static int llama_kq_mask_hint_mode() {
+ // keep op_params stable for the SYCL graph cache)
+ static constexpr uint32_t LLAMA_KQ_MASK_HINT_MIN_TOKENS = 32;
+ 
++// [prefill2] GGML_SYCL_FA_STATS=1 (default 0; the same switch as the SYCL backend's counters): per-process counters of the
++// KQ-mask hint as llama decides it. Categories: small (< 32 tokens, never tagged), tagged, and untagged by reason:
++// hint mode off, non-causal/SWA/ALiBi, multi-stream, multi-sequence ubatch, other sequences in the cache, positions
++// not strictly increasing (e.g. M-RoPE image tokens), non-empty tail, ubatch not the last cells.
++static int64_t g_kq_mask_st[12] = {};   // [0] small, [1] tagged, [2..9] untagged by reason (0..7), [10] fills skipped, [11] marked not-uploaded
++static int64_t g_kq_mask_st_last[3] = {};
++static void llama_kq_mask_stats_print() {
++    const int64_t * s = g_kq_mask_st;
++    fprintf(stderr, "[kq-mask-stats] masks=%lld small=%lld tagged=%lld marked_no_upload=%lld fill_skipped=%lld | untagged: "
++            "hint_off=%lld noncausal_swa_alibi=%lld multistream=%lld multiseq=%lld other_seqs=%lld pos_not_increasing=%lld "
++            "tail_not_empty=%lld not_last_cells=%lld | last n_kv=%lld n_used=%lld n_tokens=%lld\n",
++            (long long) (s[0] + s[1] + s[2] + s[3] + s[4] + s[5] + s[6] + s[7] + s[8] + s[9]), (long long) s[0],
++            (long long) s[1], (long long) s[11], (long long) s[10], (long long) s[2], (long long) s[3], (long long) s[4],
++            (long long) s[5], (long long) s[6], (long long) s[7], (long long) s[8], (long long) s[9],
++            (long long) g_kq_mask_st_last[0], (long long) g_kq_mask_st_last[1], (long long) g_kq_mask_st_last[2]);
++    fflush(stderr);
++}
++static bool llama_kq_mask_stats_on() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_SYCL_FA_STATS");
++        const bool v = e && atoi(e) > 0;
++        if (v) {
++            atexit(llama_kq_mask_stats_print);
++        }
++        return v;
++    }();
++    return on;
++}
++// cat: -1 small, 0 tagged, 1 + reason untagged
++static void llama_kq_mask_stats_add(int cat, bool filled, bool no_upload, int64_t n_kv, int64_t n_used, int64_t n_tokens) {
++    g_kq_mask_st[cat < 0 ? 0 : cat + 1]++;
++    if (!filled) g_kq_mask_st[10]++;
++    if (no_upload) g_kq_mask_st[11]++;
++    g_kq_mask_st_last[0] = n_kv; g_kq_mask_st_last[1] = n_used; g_kq_mask_st_last[2] = n_tokens;
++    int64_t n = 0;
++    for (int i = 0; i < 10; ++i) n += g_kq_mask_st[i];
++    if (n >= 8 && (n & (n - 1)) == 0) {
++        llama_kq_mask_stats_print();
++    }
++}
++
+ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+     const uint32_t n_tokens = ubatch->n_tokens;
+ 
+@@ -1871,6 +1912,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+     // [prefillx] structure hint (from the cell positions, before the fill)
+     bool    hinted = false;
+     int64_t n_used = 0;
++    int     why    = 0;   // [prefill2] GGML_SYCL_FA_STATS: why a >= 32-token mask was not tagged (see llama_kq_mask_stats)
++    if (llama_kq_mask_hint_mode() > 0 && n_tokens >= LLAMA_KQ_MASK_HINT_MIN_TOKENS) {
++        why = !(causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi) ? 1 : n_stream != 1 ? 2 : 0;
++    }
+     if (llama_kq_mask_hint_mode() > 0 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi &&
+         n_stream == 1 && n_tokens >= LLAMA_KQ_MASK_HINT_MIN_TOKENS) {
+         const llama_seq_id s0 = ubatch->seq_id[0][0];
+@@ -1878,23 +1923,28 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+         for (uint32_t i = 0; i < n_tokens && ok; ++i) {
+             ok = ubatch->n_seq_id[i] == 1 && ubatch->seq_id[i][0] == s0;
+         }
++        if (!ok) why = 3;
+         const auto & cells = v_cells.at(seq_to_stream[s0]);
+         ok = ok && cells.get_used() == cells.seq_n_cells(s0) && (int64_t) cells.size() >= n_kv;
++        if (!ok && !why) why = 4;
+         if (ok) {
+             const llama_pos * P = cells.pos_data();
+             while (n_used < n_kv && P[n_used] >= 0) {
+                 if (n_used > 0 && P[n_used] <= P[n_used - 1]) {
+                     ok = false;
++                    why = 5;
+                     break;
+                 }
+                 n_used++;
+             }
+             for (int64_t j = n_used; ok && j < n_kv; ++j) {
+                 ok = P[j] < 0;
++                if (!ok) why = 6;
+             }
+-            ok = ok && n_used >= (int64_t) n_tokens;
++            if (ok && n_used < (int64_t) n_tokens) { ok = false; why = 7; }
+             for (uint32_t i = 0; ok && i < n_tokens; ++i) {
+                 ok = P[n_used - n_tokens + i] == ubatch->pos[i];
++                if (!ok) why = 7;
+             }
+         }
+         if (ok) {
+@@ -1916,6 +1966,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+     }();
+     const bool filled = !(nofill && hinted && dst->op_params[3] == 1);
+ 
++    // [prefill2] GGML_SYCL_FA_STATS: tag counters, printed to stderr (not the llama log) at exit and at powers of two
++    if (llama_kq_mask_stats_on()) {
++        llama_kq_mask_stats_add(n_tokens < LLAMA_KQ_MASK_HINT_MIN_TOKENS ? -1 : hinted ? 0 : why + 1, filled,
++                                hinted && dst->op_params[3] == 1, n_kv, n_used, n_tokens);
++    }
++
+     if (filled) {
+         if (dst->type == GGML_TYPE_F16) {
+             set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+@@ -2237,16 +2293,36 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
+     return gf;
+ }
+ 
++// [prefill2] env LLAMA_KV_CKPT_PARTIAL_SKIP=1 (default 0): a PARTIAL_ONLY state of a plain (non-SWA) KV cache - the MTP
++// draft context's part of every server context checkpoint - holds no cells. The cache can drop any suffix with seq_rm,
++// which the server does right after restoring a checkpoint, and the cells below the checkpoint position are the ones the
++// checkpoint copied (they are never rewritten while the checkpoint is valid), so the full copy (tens of MiB D2H per
++// checkpoint, H2D per restore) is not needed. SWA caches keep the full copy (their partial state is the SWA window).
++static bool llama_kv_ckpt_partial_skip() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_KV_CKPT_PARTIAL_SKIP");
++        return e && atoi(e) != 0;
++    }();
++    return v;
++}
++
+ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+     }
+ 
+-    GGML_UNUSED(flags);
+-
+     io.write(&n_stream, sizeof(n_stream));
+ 
++    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && seq_id >= 0 && swa_type == LLAMA_SWA_TYPE_NONE &&
++        llama_kv_ckpt_partial_skip()) {
++        const uint32_t cell_count = 0;
++        for (uint32_t s = 0; s < n_stream; ++s) {
++            io.write(&cell_count, sizeof(cell_count));
++        }
++        return;
++    }
++
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         cell_ranges_t cr { s, {} };
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index dab22d51c7..6e58d54b3e 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -534,6 +534,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     ggml_set_name(inp->h, "mtp_h_input");
+ 
+     ggml_tensor * h_embd = inp->h;
++    // [prefill2] LLAMA_MTP_H_DEVICE: this ubatch's h rows are already on the device (written by the target's graph)
++    if (cparams.mtp_h_dev != nullptr && cparams.mtp_h_dev_role == 2 && cparams.mtp_h_dev_row0 >= 0) {
++        GGML_ASSERT(cparams.mtp_h_dev->ne[0] == hparams.n_embd);
++        GGML_ASSERT(cparams.mtp_h_dev_row0 + n_tokens <= cparams.mtp_h_dev->ne[1]);
++        h_embd = ggml_view_2d(ctx0, cparams.mtp_h_dev, hparams.n_embd, n_tokens, cparams.mtp_h_dev->nb[1],
++                (size_t) cparams.mtp_h_dev_row0 * cparams.mtp_h_dev->nb[1]);
++    }
+ 
+     res->add_input(std::move(inp));
+ 
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index ba41287d8e..fb51351274 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -252,12 +252,12 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
+ }
+ 
+ static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
+-        std::vector<std::thread> & workers, const std::vector<uint16_t> & base_log_probs, kl_divergence_result & kld,
++        std::vector<std::thread> & workers, const uint16_t * base_log_probs, kl_divergence_result & kld,
+         float * kld_values, float * p_diff_values) {
+     std::mutex mutex;
+     const int nv = 2*((n_vocab + 1)/2) + 4;
+     int counter = 0;
+-    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
++    auto compute = [&mutex, &counter, base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
+         kl_divergence_result local_kld;
+         while (true) {
+             std::unique_lock<std::mutex> lock(mutex);
+@@ -279,7 +279,7 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
+                 break;
+             }
+             lock.unlock();
+-            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld);
++            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs + size_t(i)*nv, tokens[i+1], local_kld);
+             kld_values[i]    = (float)v.first;
+             p_diff_values[i] = v.second;
+         }
+@@ -524,8 +524,12 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
+         logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
+         const int nv = 2*((n_vocab + 1)/2) + 4;
+-        log_probs.resize(size_t(n_ctx) * nv);
++        // [prefill2] only the scored rows (n_ctx - 1 - n_ctx/2) are ever written
++        log_probs.resize(size_t(n_ctx - 1 - n_ctx/2) * nv);
+     }
++    // [prefill2] PPL_STREAM=1: score each batch's outputs right after its decode instead of keeping the logits of a
++    // whole chunk (n_ctx/2 x n_vocab floats: 16 GB at n_ctx 32k); same rows, same file layout (n_seq == 1 only)
++    const bool ppl_stream = getenv("PPL_STREAM") && atoi(getenv("PPL_STREAM")) != 0 && n_seq == 1 && num_batches > 1;
+ 
+     // We get the logits for all the tokens in the context window (params.n_ctx)
+     // from llama_decode below.  Now, based on https://huggingface.co/docs/transformers/perplexity,
+@@ -591,6 +595,22 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+                 return {tokens, -1, logit_history, prob_history};
+             }
+ 
++            if (ppl_stream) {
++                const int p0    = std::max(first, j*n_batch);
++                const int nrows = std::min(n_outputs, (n_ctx - 1) - p0);
++                if (n_outputs > 0 && nrows > 0) {
++                    llama_token * tokens_data = tokens.data() + start + p0;
++                    if (!params.logits_file.empty()) {
++                        process_logits(logits_stream, n_vocab, llama_get_logits(ctx), tokens_data, nrows, workers, log_probs, nll, nll2);
++                    } else {
++                        process_logits(n_vocab, llama_get_logits(ctx), tokens_data, nrows, workers, nll, nll2,
++                                logit_history.data() + start + p0, prob_history.data() + start + p0);
++                    }
++                    count += nrows;
++                }
++                continue;
++            }
++
+             if (num_batches > 1 && n_outputs > 0) {
+                 const auto * batch_logits = llama_get_logits(ctx);
+                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
+@@ -615,7 +635,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+ 
+             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
+-            if (!params.logits_file.empty()) {
++            if (ppl_stream) {
++                // already scored batch by batch
++            } else if (!params.logits_file.empty()) {
+                 process_logits(logits_stream, n_vocab, all_logits,
+                         tokens_data, n_ctx - 1 - first,
+                         workers, log_probs, nll, nll2);
+@@ -626,7 +648,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+                         logit_history.data() + start + seq*n_ctx + first,
+                         prob_history.data()  + start + seq*n_ctx + first);
+             }
+-            count += n_ctx - first - 1;
++            if (!ppl_stream) {
++                count += n_ctx - first - 1;
++            }
+ 
+             // perplexity is e^(average negative log-likelihood)
+             if (params.ppl_output_type == 0) {
+@@ -1791,6 +1815,12 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+ 
+     const int first = n_ctx/2;
+ 
++    // [prefill2] PPL_STREAM=1: score each batch's outputs right after its decode (see perplexity())
++    const bool ppl_stream = getenv("PPL_STREAM") && atoi(getenv("PPL_STREAM")) != 0 && n_seq == 1 && num_batches > 1;
++    if (ppl_stream) {
++        logits = std::vector<float>();
++    }
++
+     for (int i = 0; i < n_chunk; i += n_seq) {
+         const int start =     i * n_ctx;
+         const int end   = start + n_ctx;
+@@ -1802,6 +1832,14 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+         // clear the KV cache
+         llama_memory_clear(llama_get_memory(ctx), true);
+ 
++        if (ppl_stream) {
++            if (in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
++                LOG_ERR("%s: failed reading log-probs for chunk %d\n", __func__, i);
++                llama_batch_free(batch);
++                return;
++            }
++        }
++
+         for (int j = 0; j < num_batches; ++j) {
+             const int batch_start = start + j * n_batch;
+             const int batch_size  = std::min(end - batch_start, n_batch);
+@@ -1837,6 +1875,16 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+                 return;
+             }
+ 
++            if (ppl_stream) {
++                const int p0    = std::max(first, j*n_batch);
++                const int nrows = std::min(n_outputs, (int) n_ctx - 1 - p0);
++                if (n_outputs > 0 && nrows > 0) {
++                    process_logits(n_vocab, llama_get_logits(ctx), tokens.data() + start + p0, nrows, workers,
++                            log_probs_uint16.data() + size_t(p0 - first)*nv, kld, kld_ptr + (p0 - first), p_diff_ptr + (p0 - first));
++                }
++                continue;
++            }
++
+             if (num_batches > 1 && n_outputs > 0) {
+                 const auto * batch_logits = llama_get_logits(ctx);
+                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
+@@ -1860,7 +1908,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+ 
+         // Read log probs for each sequence in the batch
+         for (int seq = 0; seq < n_seq_batch; seq++) {
+-            if (in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
++            if (!ppl_stream && in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
+                 LOG_ERR("%s: failed reading log-probs for chunk %d\n", __func__, i + seq);
+                 llama_batch_free(batch);
+                 return;
+@@ -1868,8 +1916,10 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+ 
+             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
+ 
+-            process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
+-                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
++            if (!ppl_stream) {
++                process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
++                        workers, log_probs_uint16.data(), kld, kld_ptr, p_diff_ptr);
++            }
+             p_diff_ptr += n_ctx - 1 - first;
+             kld_ptr    += n_ctx - 1 - first;
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 2573de51e2..5700ce7855 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -305,8 +305,11 @@ struct server_slot {
+             return false;
+         }
+ 
++        const bool hp = llama_hprof_enabled(); // [prefill2] LLAMA_HOST_PROF: prompt-cache save split
++        int64_t hp_t0 = hp ? ggml_time_us() : 0;
+         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
++        if (hp) { llama_hprof_record("psave.size", hp_t0); hp_t0 = ggml_time_us(); }
+ 
+         const size_t cur_size = cur_size_tgt + cur_size_dft;
+ 
+@@ -314,20 +317,25 @@ struct server_slot {
+                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+ 
+         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, keep);
++        if (hp) { llama_hprof_record("psave.alloc", hp_t0); hp_t0 = ggml_time_us(); }
+         if (cur == nullptr) {
+             return false;
+         }
+ 
+         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        if (hp) { llama_hprof_record("psave.get_tgt", hp_t0); hp_t0 = ggml_time_us(); }
+         if (ctx_dft) {
+             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         }
++        if (hp) { llama_hprof_record("psave.get_dft", hp_t0); }
+ 
+         return true;
+     }
+ 
+     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
++        const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2]
+         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
++        if (hp_t0) llama_hprof_record("pload", hp_t0);
+         if (!res) {
+             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+         }
+@@ -2390,8 +2398,12 @@ private:
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+ 
++        const int64_t hp_ck0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2] LLAMA_HOST_PROF
+         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        if (hp_ck0) llama_hprof_record("srv.ckpt.create.tgt", hp_ck0);
++        const int64_t hp_ck1 = llama_hprof_enabled() ? ggml_time_us() : 0;
+         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        if (hp_ck1) llama_hprof_record("srv.ckpt.create.dft", hp_ck1);
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+ 
+@@ -3451,8 +3463,12 @@ private:
+ 
+                                     if (!do_reset) {
+                                         // restore the context checkpoint
++                                        const int64_t hp_cr0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2]
+                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                                        if (hp_cr0) llama_hprof_record("srv.ckpt.restore.tgt", hp_cr0);
++                                        const int64_t hp_cr1 = llama_hprof_enabled() ? ggml_time_us() : 0;
+                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                                        if (hp_cr1) llama_hprof_record("srv.ckpt.restore.dft", hp_cr1);
+                                         // restore the draft's speculative state
+                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+ 

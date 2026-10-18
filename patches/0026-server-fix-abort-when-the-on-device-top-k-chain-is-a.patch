@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Mon, 28 Sep 2026 20:19:16 -0600
+Subject: [PATCH 26/27] server : fix abort when the on-device top-k chain is
+ attached again
+
+With LLAMA_TGT_TOPK_DEVICE=1 the slot keeps one top-k chain and attaches
+it to the target context. A request that cannot use it (logprobs, a
+sampler order that does not start with top-k, top_k 0 or >= 1024,
+backend sampling) detaches it. The next ordinary request attached the
+same chain object again, and llama_sampler_chain_backend_init() asserts
+on a second call:
+
+  llama-sampler.cpp: GGML_ASSERT(chain->is_init == false &&
+  "llama_sampler_chain_backend_init() called twice")
+
+so the server aborted (plain request, logprobs request, plain request
+is enough). A chain that was detached is now replaced by a new one.
+
+Assisted-by: Claude Fable 5.1
+---
+ tools/server/server-context.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index f99428f9f1..b2f29c6f73 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1949,7 +1949,9 @@ private:
+                 slot.tgt_topk_set = false;
+                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+             } else if (tgt_topk_k > 0 && tgt_topk_k < 1024) {
+-                if (slot.tgt_topk_chain == nullptr || slot.tgt_topk_k != tgt_topk_k) {
++                // a chain is attached at most once (its backend_init asserts on a second call): after a request that
++                // could not use it detached it (logprobs, another sampler order, backend sampling) a new one is made
++                if (slot.tgt_topk_chain == nullptr || slot.tgt_topk_k != tgt_topk_k || !slot.tgt_topk_set) {
+                     llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                     llama_sampler_chain_add(chain, llama_sampler_init_top_k(tgt_topk_k + 1));
+                     if (slot.tgt_topk_set) {

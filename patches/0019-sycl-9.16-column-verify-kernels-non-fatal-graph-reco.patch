@@ -1,0 +1,1993 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Mon, 28 Sep 2026 02:05:43 -0600
+Subject: [PATCH 19/27] sycl : 9..16-column verify kernels, non-fatal graph
+ recording failures
+
+GGML_SYCL_XMX_WIDE=1 (default off) serves 9..16-token batches on XMX:
+- q4_K / q6_K register-fed two-tile kernels (bit-identical to the
+  joint_matrix two-tile kernels at equal split-K), q6_K and q8_0
+  two-tile joint_matrix kernels
+- flash attention above 48 query rows as query-row splits (f16 and
+  q8_0 KV)
+- gated-delta alpha/beta split-K fusion up to 16 columns
+1..8-column paths are unchanged.
+A sycl::exception raised while a command graph is being recorded is
+rethrown to the recorder (the graph then runs eagerly) instead of
+exiting the process. GGML_SYCL_LOG_GEMM_FALLBACK and
+GGML_SYCL_GRAPH_FAULT_INJECT are diagnostics.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-sycl/common.cpp         |   4 +-
+ ggml/src/ggml-sycl/common.hpp         |  12 +
+ ggml/src/ggml-sycl/cpy.cpp            |   2 +-
+ ggml/src/ggml-sycl/dq-gemm.cpp        |   2 +-
+ ggml/src/ggml-sycl/fattn-xmx.cpp      |  40 ++-
+ ggml/src/ggml-sycl/ggml-sycl.cpp      | 124 ++++++---
+ ggml/src/ggml-sycl/mmq-dnn-u4.cpp     |   4 +-
+ ggml/src/ggml-sycl/mmq-xmx-direct.cpp | 356 ++++++++++++++++++++++++++
+ ggml/src/ggml-sycl/mmq-xmx-direct.hpp |  11 +
+ ggml/src/ggml-sycl/mmq-xmx-q4k.cpp    |  28 +-
+ ggml/src/ggml-sycl/mmq-xmx-q6k.cpp    | 289 ++++++++++++++++++++-
+ ggml/src/ggml-sycl/mmq-xmx-q80.cpp    | 164 +++++++++++-
+ ggml/src/ggml-sycl/mmq-xmx-q80.hpp    |   8 +
+ ggml/src/ggml-sycl/mmq.cpp            |  22 +-
+ ggml/src/ggml-sycl/mmvq.cpp           |  21 +-
+ tests/test-backend-ops.cpp            |  88 ++++++-
+ 16 files changed, 1092 insertions(+), 83 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/common.cpp b/ggml/src/ggml-sycl/common.cpp
+index 3a0165727f..99bc2086a2 100644
+--- a/ggml/src/ggml-sycl/common.cpp
++++ b/ggml/src/ggml-sycl/common.cpp
+@@ -43,7 +43,7 @@ void* ggml_sycl_host_malloc(size_t size) try {
+ } catch (sycl::exception const& exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ void ggml_sycl_host_free(void* ptr) try {
+@@ -52,7 +52,7 @@ void ggml_sycl_host_free(void* ptr) try {
+ } catch (sycl::exception const& exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ bool gpu_has_xmx(sycl::device &dev) {
+diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
+index d8ca20a168..67bc10d276 100644
+--- a/ggml/src/ggml-sycl/common.hpp
++++ b/ggml/src/ggml-sycl/common.hpp
+@@ -160,6 +160,18 @@ extern bool g_ggml_sycl_graph_recording;
+   GGML_ABORT("SYCL error");
+ }
+ 
++// LOCAL (wideverify): the op-level `catch (sycl::exception ...)` handlers end with this instead of std::exit(1).
++// While a command graph is being recorded the exception is rethrown to the recorder (ggml_sycl_graph_record), which
++// drops the recording and runs that graph eagerly - e.g. a oneDNN GEMM inside a recording ("Graph nodes cannot depend
++// on events from outside the graph"); otherwise the process exits as before. Only valid inside a catch handler.
++#define GGML_SYCL_EXIT_OR_RETHROW()        \
++    do {                                   \
++        if (g_ggml_sycl_graph_recording) { \
++            throw;                         \
++        }                                  \
++        std::exit(1);                      \
++    } while (0)
++
+ #define SYCL_CHECK(err)                                                                                    \
+     do {                                                                                                   \
+         auto err_ = (err);                                                                                 \
+diff --git a/ggml/src/ggml-sycl/cpy.cpp b/ggml/src/ggml-sycl/cpy.cpp
+index ef7413abd8..90c38121c3 100644
+--- a/ggml/src/ggml-sycl/cpy.cpp
++++ b/ggml/src/ggml-sycl/cpy.cpp
+@@ -1424,7 +1424,7 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
+     }
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ void ggml_sycl_dup(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-sycl/dq-gemm.cpp b/ggml/src/ggml-sycl/dq-gemm.cpp
+index 1f62710ade..7cb67b3d7a 100644
+--- a/ggml/src/ggml-sycl/dq-gemm.cpp
++++ b/ggml/src/ggml-sycl/dq-gemm.cpp
+@@ -240,5 +240,5 @@ void ggml_sycl_mul_mat_dq_gemm(ggml_backend_sycl_context & ctx, const ggml_tenso
+ #endif
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+diff --git a/ggml/src/ggml-sycl/fattn-xmx.cpp b/ggml/src/ggml-sycl/fattn-xmx.cpp
+index 73630c1af6..95fbe8de63 100644
+--- a/ggml/src/ggml-sycl/fattn-xmx.cpp
++++ b/ggml/src/ggml-sycl/fattn-xmx.cpp
+@@ -4,6 +4,7 @@
+ // Kernel: b70-secret-sauce/xmx-probe/xmx_fa.cpp, VAR 1 (NSG 8, TPS 8, GRF 256, QS 2 for R > 24), host harness removed.
+ //
+ #include "fattn-xmx.hpp"
++#include "mmq-xmx-q80.hpp"   // ggml_sycl_xmx_wide
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -53,7 +54,7 @@ static int ggml_sycl_fattn_xmx_min_cols() {
+ }
+ 
+ static int ggml_sycl_fattn_xmx_max_cols() {
+-    static const int v = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_MAX_COLS", 8);
++    static const int v = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_MAX_COLS", ggml_sycl_xmx_wide() ? 16 : 8);
+     return v;
+ }
+ 
+@@ -75,6 +76,32 @@ static int ggml_sycl_fattn_xmx_q8_min_cols() {
+     return v;
+ }
+ 
++// LOCAL (longdraft): query batches with more than XFA_MAXR rows (GQA ratio x tokens, e.g. 6 x 9..16 tokens) run as
++// qs query-row splits of at most XFA_MAXR rows each (the kernel's row -> (token, head) map is per row); the smallest
++// qs >= 2 that divides R, or GGML_SYCL_XMX_FA_QS_WIDE when it divides R into valid splits. 0 = no valid split, or
++// GGML_SYCL_XMX_WIDE off.
++static int ggml_sycl_fattn_xmx_wide_qs(int64_t R) {
++    if (!ggml_sycl_xmx_wide()) {   // opt-in: without it R > XFA_MAXR keeps declining, as before
++        return 0;
++    }
++    static const int qs_env = ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_QS_WIDE", 0);
++    if (qs_env > 0 && R % qs_env == 0 && R / qs_env <= XFA_MAXR) {
++        return qs_env;
++    }
++    // prefer splits of <= GGML_SYCL_XMX_FA_WIDE_RW (default 32) rows: at kv 51200, 16 tokens x GQA 6 measured
++    // qs 2 (48 rows) 1025 us, qs 3 (32 rows) 709, qs 4 (24 rows) 804, qs 6 (16 rows) 885; 10 tokens: qs 2 (30 rows) 522,
++    // qs 3 630, qs 4 597 (the 5-6 accumulator-tile kernels, > 32 rows, run ~1.8x slower per row)
++    static const int rw_pref = std::max(8, std::min(XFA_MAXR, ggml_sycl_fattn_xmx_env_int("GGML_SYCL_XMX_FA_WIDE_RW", 32)));
++    for (int lim : { rw_pref, XFA_MAXR }) {
++        for (int q = 2; q <= 8; ++q) {
++            if (R % q == 0 && R / q <= lim) {
++                return q;
++            }
++        }
++    }
++    return 0;
++}
++
+ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
+ #if !GGML_SYCL_XMX
+     GGML_UNUSED(device);
+@@ -123,7 +150,7 @@ bool ggml_sycl_fattn_xmx_can_use(int device, const ggml_tensor * dst) {
+     if (K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 || V->ne[2] != K->ne[2] || V->ne[1] != kv) {
+         return false;
+     }
+-    if ((Q->ne[2] / K->ne[2]) * nb > XFA_MAXR) {
++    if ((Q->ne[2] / K->ne[2]) * nb > XFA_MAXR && ggml_sycl_fattn_xmx_wide_qs((Q->ne[2] / K->ne[2]) * nb) == 0) {
+         return false;
+     }
+     // whole 64-token iterations only (llama.cpp pads the KV length to 256); no tail masking
+@@ -800,7 +827,9 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
+     const int kv    = (int) K->ne[1];
+     const int ratio = nh / nhkv;
+     const int R     = nb * ratio;
+-    GGML_ASSERT(R <= XFA_MAXR && kv % XFA_T == 0);
++    GGML_ASSERT(kv % XFA_T == 0);
++    const int qs_wide = R > XFA_MAXR ? ggml_sycl_fattn_xmx_wide_qs(R) : 0;   // LOCAL (longdraft): > 8 tokens
++    GGML_ASSERT(R <= XFA_MAXR || qs_wide > 0);
+ 
+     float scale = 1.0f;
+     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+@@ -817,6 +846,9 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
+     if (qs_env > 0 && (v2 ? R % qs_env : nb % qs_env) == 0 && (R / qs_env) <= XFA_MAXR) {
+         qs = qs_env;
+     }
++    if (qs_wide > 0) {
++        qs = qs_wide;
++    }
+     const int Rw  = R / qs;
+     const int R8p = (Rw + 7) / 8 * 8;   // rows per work-group, padded to the 8-row accumulator
+ 
+@@ -889,7 +921,7 @@ void ggml_sycl_fattn_xmx(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try
+     xfa_dispatch(*ctx.stream(), p);
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ #else  // !GGML_SYCL_XMX
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 3d6e12384f..6cf1af06ba 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -34,6 +34,8 @@
+ #include <utility>
+ #include <chrono>
+ #include <map>
++#include <mutex>
++#include <set>
+ #include <tuple>
+ #include <cstring>
+ #include <string>
+@@ -475,6 +477,7 @@ static void ggml_check_sycl() try {
+         }
+         if (ggml_sycl_xmx_q4k_built()) {
+             // same build switch; probes (and caches) the f16 matrix combination per device
++            GGML_LOG_INFO("  GGML_SYCL_XMX_WIDE: %d (XMX q6_K / q8_0 / FA at 9..16 columns)\n", (int) ggml_sycl_xmx_wide());
+             GGML_LOG_INFO("  GGML_SYCL_XMX_FA: %d (built, matrix f16:", (int) ggml_sycl_fattn_xmx_env());
+             for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count() && i < GGML_SYCL_MAX_DEVICES; ++i) {
+                 GGML_LOG_INFO(" dev%u %s", i, ggml_sycl_fattn_xmx_device_ok((int) i) ? "YES" : "NO");
+@@ -569,7 +572,7 @@ static void ggml_check_sycl() try {
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ /*
+@@ -604,7 +607,7 @@ GGML_API void ggml_backend_sycl_get_gpu_list(int *id_list, int max_len) try {
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ inline void free_aligned_mem_host(void * memblock) {
+@@ -666,7 +669,7 @@ ggml_backend_sycl_buffer_free_buffer(ggml_backend_buffer_t buffer) try {
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void * ggml_backend_sycl_buffer_get_base(ggml_backend_buffer_t buffer) {
+@@ -722,7 +725,7 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+@@ -750,7 +753,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+@@ -772,7 +775,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+@@ -891,7 +894,7 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
+     GGML_UNUSED(buffer);
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_backend_sycl_buffer_clear(ggml_backend_buffer_t buffer,
+@@ -917,7 +920,7 @@ static void ggml_backend_sycl_buffer_clear(ggml_backend_buffer_t buffer,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_backend_sycl_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value,
+@@ -1044,7 +1047,7 @@ ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static size_t ggml_backend_sycl_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+@@ -1242,7 +1245,7 @@ struct ggml_backend_sycl_split_buffer_context {
+     catch (sycl::exception const &exc) {
+       std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+                 << ", line:" << __LINE__ << std::endl;
+-      std::exit(1);
++      GGML_SYCL_EXIT_OR_RETHROW();
+     }
+ 
+     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
+@@ -1335,7 +1338,7 @@ ggml_backend_sycl_split_buffer_init_tensor(ggml_backend_buffer_t buffer,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void
+@@ -1391,7 +1394,7 @@ ggml_backend_sycl_split_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void
+@@ -1447,7 +1450,7 @@ ggml_backend_sycl_split_buffer_get_tensor(ggml_backend_buffer_t buffer,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_backend_sycl_split_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+@@ -2948,7 +2951,7 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *dst,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ inline void ggml_sycl_op_mul_mat_sycl(
+@@ -2969,6 +2972,15 @@ inline void ggml_sycl_op_mul_mat_sycl(
+ 
+     const int64_t row_diff = row_high - row_low;
+ 
++    // LOCAL (wideverify) test hook, GGML_SYCL_GRAPH_FAULT_INJECT=1: raise the error a oneDNN GEMM raises inside a
++    // recording ("Graph nodes cannot depend on events from outside the graph") on every recorded call of this path,
++    // so test-backend-ops can check that the recorder falls back to eager instead of the process exiting
++    static const bool fault_inject = ggml_sycl_get_env("GGML_SYCL_GRAPH_FAULT_INJECT", 0) != 0;
++    if (fault_inject && g_ggml_sycl_graph_recording) {
++        throw sycl::exception(sycl::make_error_code(sycl::errc::invalid),
++                              "GGML_SYCL_GRAPH_FAULT_INJECT: simulated recording failure in ggml_sycl_op_mul_mat_sycl");
++    }
++
+     int id;
+     SYCL_CHECK(
+         CHECK_TRY_ERROR(id = get_current_device_id()));
+@@ -3113,7 +3125,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ inline void ggml_sycl_op_sum(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
+@@ -3502,7 +3514,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
+                 } catch (sycl::exception const &exc) {
+                     std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
+                               << ", line:" << __LINE__ << std::endl;
+-                    std::exit(1);
++                    GGML_SYCL_EXIT_OR_RETHROW();
+                 }
+             }
+         }
+@@ -3600,7 +3612,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
+                         } catch (const sycl::exception & exc) {
+                             std::cerr << "Quantize_row_q8_1_sycl error" << exc.what()
+                                       << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-                            std::exit(1);
++                            GGML_SYCL_EXIT_OR_RETHROW();
+                         }
+                     }
+                 }
+@@ -3673,7 +3685,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_sycl_repeat_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+@@ -3739,7 +3751,7 @@ static void ggml_sycl_mul_mat_vec_p021(ggml_backend_sycl_context & ctx, const gg
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_sycl_mul_mat_vec_nc(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
+@@ -3780,7 +3792,7 @@ static void ggml_sycl_mul_mat_vec_nc(ggml_backend_sycl_context & ctx, const ggml
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void k_compute_batched_ptrs(const sycl::half * src0_as_f16, const sycl::half * src1_as_f16, void * dst,
+@@ -4054,7 +4066,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
+     }
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ enum class mul_mat_algo {
+@@ -4771,6 +4783,26 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
+     }
+ }
+ 
++// LOCAL (longdraft): the reorder for a q6_K / q8_0 weight that an XMX path serves at 9..16 columns. The normal
++// bootstrap (opt_for_reorder -> should_reorder_tensor) stops at 8 columns; this installs the same layout (a no-op once
++// done). Only called for ne[1] > 8, so the 1..8-column dispatch is untouched.
++static void opt_for_reorder_wide(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
++    if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
++        return;
++    }
++    if (src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_Q8_0) {
++        return;
++    }
++    ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
++    if (!extra || extra->optimized_feature.reorder) {
++        return;
++    }
++    if (reorder_qw(src0, ctx->stream())) {
++        extra->optimized_feature.reorder = true;
++        g_ggml_sycl_opt_epoch.fetch_add(1, std::memory_order_relaxed); // [hostv]
++    }
++}
++
+ // Lazily reorder supported MoE expert weights once their fused path is used.
+ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
+     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
+@@ -4907,7 +4939,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+     // LOCAL: q8_0 x 2..8 columns on the XMX matrix units (mmq-xmx-q80.cpp), for the big q8_0 LM head at verify column
+     // counts: MMVQ reorder layout read in place. Default off (GGML_SYCL_XMX_Q80=1); weights under 64 MB stay on MMVQ.
+     if (!split && !smallrow && ggml_sycl_xmx_q80_can_use(ctx, src0, src1, dst)) {
+-        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
++        if (src1->ne[1] > 8) {
++            opt_for_reorder_wide(&ctx, src0);   // LOCAL (longdraft)
++        } else {
++            opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
++        }
+         const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+         if (extra && extra->optimized_feature.reorder) {
+             ggml_sycl_mul_mat_xmx_q80(ctx, src0, src1, dst);
+@@ -4919,7 +4955,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+     // read in place, the same SoA q8_1 activations); small weights stay on MMVQ (can_use's minimum-work guards).
+     // Default off (GGML_SYCL_XMX_Q6K=1).
+     if (!split && !smallrow && ggml_sycl_xmx_q6k_can_use(ctx, src0, src1, dst)) {
+-        opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
++        if (src1->ne[1] > 8) {
++            opt_for_reorder_wide(&ctx, src0);   // LOCAL (longdraft)
++        } else {
++            opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
++        }
+         const ggml_tensor_extra_gpu * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+         if (extra && extra->optimized_feature.reorder) {
+             if (ggml_sycl_xmx_q6k_path() == 1) {
+@@ -4984,6 +5024,20 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
+     } else if (use_mul_mat_q) {
+         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
+     } else {
++        // LOCAL (wideverify): GGML_SYCL_LOG_GEMM_FALLBACK=1 names every weight / column count that reaches the
++        // dequantize + oneDNN/MKL GEMM path (once each; with GGML_SYCL_ENABLE_GRAPH=1 such a graph cannot be recorded)
++        static const bool log_fb = ggml_sycl_get_env("GGML_SYCL_LOG_GEMM_FALLBACK", 0) != 0;
++        if (log_fb) {
++            static std::mutex mu;
++            static std::set<std::string> seen;
++            char key[256];
++            snprintf(key, sizeof(key), "%s %s %lldx%lld cols %lld", src0->name, ggml_type_name(src0->type),
++                     (long long) src0->ne[1], (long long) src0->ne[0], (long long) src1->ne[1]);
++            std::lock_guard<std::mutex> lk(mu);
++            if (seen.insert(key).second) {
++                GGML_LOG_WARN("[SYCL] mul_mat GEMM fallback: %s%s\n", key, g_ggml_sycl_graph_recording ? " (recording)" : "");
++            }
++        }
+         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_sycl);
+     }
+ }
+@@ -5493,7 +5547,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+@@ -5585,7 +5639,7 @@ static void ggml_sycl_set_main_device(const int main_device) try {
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst) try {
+@@ -5975,7 +6029,7 @@ GGML_API void ggml_backend_sycl_get_device_description(int device, char *descrip
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ bool sycl_get_mem_info(int device, size_t * free, size_t * total) {
+@@ -6004,7 +6058,7 @@ void ggml_backend_sycl_get_device_memory(int device, size_t * free, size_t * tot
+     ggml_sycl_memtrace_report_device("device memory query", device, *free, *total);
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -6043,7 +6097,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
+@@ -6064,7 +6118,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
+@@ -6094,7 +6148,7 @@ static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
+@@ -6108,7 +6162,7 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t) {
+@@ -7562,7 +7616,7 @@ catch (sycl::exception const &exc)
+ {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+               << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_event_t event) try {
+@@ -7576,7 +7630,7 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
+ } catch (sycl::exception const& exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+               << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static ggml_backend_i ggml_backend_sycl_interface = {
+@@ -8176,7 +8230,7 @@ static void ggml_backend_sycl_device_event_free(ggml_backend_dev_t dev, ggml_bac
+ } catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ 
+@@ -8189,7 +8243,7 @@ static void ggml_backend_sycl_device_event_synchronize(ggml_backend_dev_t dev, g
+ } catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static const ggml_backend_device_i ggml_backend_sycl_device_interface = {
+diff --git a/ggml/src/ggml-sycl/mmq-dnn-u4.cpp b/ggml/src/ggml-sycl/mmq-dnn-u4.cpp
+index 4cf5e75b6a..c1c63f7060 100644
+--- a/ggml/src/ggml-sycl/mmq-dnn-u4.cpp
++++ b/ggml/src/ggml-sycl/mmq-dnn-u4.cpp
+@@ -682,10 +682,10 @@ void ggml_sycl_op_mul_mat_dnn_u4(ggml_backend_sycl_context & ctx, const ggml_ten
+     if (sync_mask & 4) { stream->wait(); }
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ } catch (const dnnl::error & e) {
+     GGML_LOG_ERROR("%s: oneDNN error: %s\n", __func__, e.what());
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ #else  // !GGML_SYCL_DNNL
+diff --git a/ggml/src/ggml-sycl/mmq-xmx-direct.cpp b/ggml/src/ggml-sycl/mmq-xmx-direct.cpp
+index 005cf4320b..1ead08b3d7 100644
+--- a/ggml/src/ggml-sycl/mmq-xmx-direct.cpp
++++ b/ggml/src/ggml-sycl/mmq-xmx-direct.cpp
+@@ -19,6 +19,8 @@
+ //
+ #include "mmq-xmx-direct.hpp"
+ 
++#include <cstdlib>
++#include <type_traits>
+ #include <utility>
+ 
+ #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+@@ -30,6 +32,10 @@ namespace {
+ 
+ typedef short xd_v8s16 __attribute__((ext_vector_type(8)));
+ typedef int   xd_v8i32 __attribute__((ext_vector_type(8)));
++typedef short xd_v4s16 __attribute__((ext_vector_type(4)));   // LOCAL (wideverify): 4- / 2-row A / C (M = 4 / 2 DPAS)
++typedef int   xd_v4i32 __attribute__((ext_vector_type(4)));
++typedef short xd_v2s16 __attribute__((ext_vector_type(2)));
++typedef int   xd_v2i32 __attribute__((ext_vector_type(2)));
+ 
+ }   // namespace
+ 
+@@ -38,8 +44,15 @@ typedef int   xd_v8i32 __attribute__((ext_vector_type(8)));
+ // Lane l holds A as short8 (row m, k = 2l..2l+1), B as int8 (column l, dword j = k 4j..4j+3) and C as int8 (column l,
+ // element m = row m).
+ SYCL_EXTERNAL xd_v8i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v8s16 a, xd_v8i32 b, xd_v8i32 acc);
++// the same extension's M = 4 form (rows 0..3 of A / C), LOCAL (wideverify)
++SYCL_EXTERNAL xd_v4i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v4s16 a, xd_v8i32 b, xd_v4i32 acc);
++SYCL_EXTERNAL xd_v2i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v2s16 a, xd_v8i32 b, xd_v2i32 acc);
++SYCL_EXTERNAL int      intel_sub_group_i8_i8_matrix_mad_k32(short a, xd_v8i32 b, int acc);
+ #else
+ static inline xd_v8i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v8s16, xd_v8i32 b, xd_v8i32) { return b; }
++static inline xd_v4i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v4s16, xd_v8i32, xd_v4i32 acc) { return acc; }
++static inline xd_v2i32 intel_sub_group_i8_i8_matrix_mad_k32(xd_v2s16, xd_v8i32, xd_v2i32 acc) { return acc; }
++static inline int      intel_sub_group_i8_i8_matrix_mad_k32(short, xd_v8i32, int acc) { return acc; }
+ #endif
+ 
+ namespace {
+@@ -324,3 +337,346 @@ sycl::event ggml_sycl_xmx_q6k_direct_launch(const uint8_t * dQl, const uint8_t *
+         });
+     });
+ }
++
++// ---- LOCAL (wideverify): 9..16 columns ----
++// q4_K: the 1..8 kernel with a second A tile (columns 8..15) on every register-built B operand. xa [G][16][32] already
++// holds 16 columns per group (tile t at +t*256 B), d8 / us are [16][G] (lane = column). Per column the float operations
++// and their order are those of the joint_matrix MC 16 kernel (xmx_q4k_launch<16>): per group, Fb[c] = fma(dot16,
++// rsd * d8, Fb[c]), Fb[c] = fma(d8 * sum(u), rw, Fb[c]); F[c] += Fb[c] per block; split-K reduced in SLM in sub-group
++// order. PRE: the block's 16 A tiles are loaded ahead of its DPAS chain (as the 1..8 kernel does) or per group.
++// T2: rows of the second A tile (8: columns 8..15; 4 / 2 / 1: columns 8..11 / 8..9 / 8 on the M = 4 / 2 / 1 DPAS)
++template <int T2> struct xd_tile2;
++template <> struct xd_tile2<8> { typedef xd_v8s16 a_t; typedef xd_v8i32 c_t; };
++template <> struct xd_tile2<4> { typedef xd_v4s16 a_t; typedef xd_v4i32 c_t; };
++template <> struct xd_tile2<2> { typedef xd_v2s16 a_t; typedef xd_v2i32 c_t; };
++template <> struct xd_tile2<1> { typedef short a_t; typedef int c_t; };
++template <typename T> static inline int xd_el(const T & v, int i) { return v[i]; }
++template <> inline int xd_el<int>(const int & v, int) { return v; }
++template <bool PRE, int T2>
++static sycl::event xd_q4k16(const uint8_t * dQs, const uint8_t * dSc, const uint32_t * dDm, const int8_t * dXa,
++                            const sycl::half * dD8c, const int32_t * dS8c, float * dOut, int N, int K, int M, int64_t ldd,
++                            int ks, sycl::queue & q) {
++    const int KB = K / QK_K, G = K / QK8_1;
++    return q.submit([&](sycl::handler & h) {
++        constexpr int MC = 8 + T2;
++        sycl::local_accessor<float, 1> red(sycl::range<1>(ks > 1 ? ks * MC * 16 : 1), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N / 16) * ks * 16), sycl::range<1>(ks * 16)),
++                       sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            using sycl::access::address_space;
++            using sycl::access::decorated;
++            sycl::sub_group sg = it.get_sub_group();
++            const int lane = sg.get_local_id()[0];
++            const int s    = sg.get_group_id()[0];
++            const int row0 = (int) it.get_group(0) * 16;
++            const int b0   = s * KB / ks, b1 = (s + 1) * KB / ks;
++            const int row  = row0 + lane;
++            const uint8_t *  qrow = dQs + (size_t) row * (K / 2);
++            const uint32_t * hsc  = reinterpret_cast<const uint32_t *>(dSc + (size_t) row * KB * 12);
++            const uint32_t * hdm  = dDm + (size_t) row * KB;
++            const sycl::uint4 * d8base = reinterpret_cast<const sycl::uint4 *>(dD8c + (size_t) lane * G);
++            const sycl::int4 *  s8base = reinterpret_cast<const sycl::int4 *>(dS8c + (size_t) lane * G);
++            const uint16_t *    xa16   = reinterpret_cast<const uint16_t *>(dXa);
++
++            sycl::uint4 w[8], wn[8];
++            {
++                const sycl::uint4 * pp = reinterpret_cast<const sycl::uint4 *>(qrow + (size_t) b0 * 128);
++#pragma unroll
++                for (int j = 0; j < 8; ++j) { w[j] = pp[j]; }
++            }
++            uint32_t hw0 = hsc[b0 * 3 + 0], hw1 = hsc[b0 * 3 + 1], hw2 = hsc[b0 * 3 + 2], hwd = hdm[b0];
++            float F[MC];
++#pragma unroll
++            for (int i = 0; i < MC; ++i) { F[i] = 0.f; }
++            for (int b = b0; b < b1; ++b) {
++                float rsd[8], rw[8];
++                {
++                    const uint32_t sc03 = hw0 & 0x3F3F3F3Fu, mn03 = hw1 & 0x3F3F3F3Fu;
++                    const uint32_t sc47 = (hw2 & 0x0F0F0F0Fu) | ((hw0 >> 2) & 0x30303030u);
++                    const uint32_t mn47 = ((hw2 >> 4) & 0x0F0F0F0Fu) | ((hw1 >> 2) & 0x30303030u);
++                    const float d    = (float) sycl::bit_cast<sycl::half>((uint16_t) (hwd & 0xFFFF));
++                    const float dmin = (float) sycl::bit_cast<sycl::half>((uint16_t) (hwd >> 16));
++                    const float d16  = d * 0.0625f, d8x = 8.f * d;
++#pragma unroll
++                    for (int g = 0; g < 8; ++g) {
++                        const float sc = (float) (uint8_t) ((g < 4 ? sc03 : sc47) >> (8 * (g & 3)));
++                        const float mn = (float) (uint8_t) ((g < 4 ? mn03 : mn47) >> (8 * (g & 3)));
++                        rw[g]  = d8x * sc - dmin * mn;
++                        rsd[g] = d16 * sc;
++                    }
++                }
++                float d8c[8], tc[8];
++                {
++                    const sycl::uint4 dh = d8base[b];
++                    const sycl::int4  sa = s8base[b * 2], sb = s8base[b * 2 + 1];
++                    const uint32_t    dw[4] = { dh.x(), dh.y(), dh.z(), dh.w() };
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) {
++                        d8c[2 * j]     = (float) sycl::bit_cast<sycl::half>((uint16_t) (dw[j] & 0xFFFF));
++                        d8c[2 * j + 1] = (float) sycl::bit_cast<sycl::half>((uint16_t) (dw[j] >> 16));
++                    }
++                    tc[0] = d8c[0] * (float) sa.x(); tc[1] = d8c[1] * (float) sa.y(); tc[2] = d8c[2] * (float) sa.z(); tc[3] = d8c[3] * (float) sa.w();
++                    tc[4] = d8c[4] * (float) sb.x(); tc[5] = d8c[5] * (float) sb.y(); tc[6] = d8c[6] * (float) sb.z(); tc[7] = d8c[7] * (float) sb.w();
++                }
++                {   // next block's header and nibbles (clamped, unconditional)
++                    const int bn = b + 1 < b1 ? b + 1 : b;
++                    hw0 = hsc[bn * 3 + 0]; hw1 = hsc[bn * 3 + 1]; hw2 = hsc[bn * 3 + 2]; hwd = hdm[bn];
++                    const sycl::uint4 * pp = reinterpret_cast<const sycl::uint4 *>(qrow + (size_t) bn * 128);
++#pragma unroll
++                    for (int j = 0; j < 8; ++j) { wn[j] = pp[j]; }
++                }
++                auto lda = [&](int g, int t) -> xd_v8s16 {
++                    const auto av = sg.load<8>(sycl::address_space_cast<address_space::global_space, decorated::yes>(
++                        xa16 + (size_t) (b * 8 + g) * 256 + t * 128));
++                    xd_v8s16 a;
++#pragma unroll
++                    for (int m = 0; m < 8; ++m) { a[m] = (short) av[m]; }
++                    return a;
++                };
++                using a2_t = typename xd_tile2<T2>::a_t;
++                using c2_t = typename xd_tile2<T2>::c_t;
++                auto lda2 = [&](int g) -> a2_t {   // the second tile's T2 rows (columns 8 .. 8 + T2 - 1)
++                    const uint16_t * p = xa16 + (size_t) (b * 8 + g) * 256 + 128;
++                    a2_t a;
++                    if constexpr (T2 == 1) {
++                        a = (short) p[lane];
++                    } else {
++                        const auto av = sg.load<T2>(sycl::address_space_cast<address_space::global_space, decorated::yes>(p));
++#pragma unroll
++                        for (int m = 0; m < T2; ++m) { a[m] = (short) av[m]; }
++                    }
++                    return a;
++                };
++                xd_v8s16 A[PRE ? 8 : 1];
++                a2_t     A2[PRE ? 8 : 1];
++                if constexpr (PRE) {
++#pragma unroll
++                    for (int g = 0; g < 8; ++g) {
++                        A[g] = lda(g, 0);
++                        A2[g] = lda2(g);
++                    }
++                }
++                float Fb[MC];
++#pragma unroll
++                for (int i = 0; i < MC; ++i) { Fb[i] = 0.f; }
++                xd_unroll(std::make_integer_sequence<int, 8>{}, [&](auto gi) {
++                    constexpr int g  = decltype(gi)::value;
++                    constexpr int ch = g >> 1;   // q4_K: group 2ch = low nibbles, 2ch+1 = high nibbles of qs[ch*32 ..]
++                    const sycl::uint4 w0 = w[2 * ch], w1 = w[2 * ch + 1];
++                    auto cv = [](uint32_t x) -> int {
++                        return (int) ((g & 1) ? ((x & 0xF0F0F0F0u) ^ 0x80808080u) : (((x << 4) & 0xF0F0F0F0u) ^ 0x80808080u));
++                    };
++                    const xd_v8i32 B = { cv(w0.x()), cv(w0.y()), cv(w0.z()), cv(w0.w()),
++                                         cv(w1.x()), cv(w1.y()), cv(w1.z()), cv(w1.w()) };
++                    auto epi = [&](auto acc, int t, auto nr) {
++                        constexpr int R = decltype(nr)::value;
++                        float sbv[R], tbv[R];
++#pragma unroll
++                        for (int i = 0; i < R; ++i) {
++                            sbv[i] = rsd[g] * sycl::select_from_group(sg, d8c[g], t * 8 + i);
++                            tbv[i] = sycl::select_from_group(sg, tc[g], t * 8 + i);
++                        }
++#pragma unroll
++                        for (int i = 0; i < R; ++i) {
++                            Fb[t * 8 + i] = sycl::fma((float) xd_el(acc, i), sbv[i], Fb[t * 8 + i]);
++                            Fb[t * 8 + i] = sycl::fma(tbv[i], rw[g], Fb[t * 8 + i]);
++                        }
++                    };
++                    {
++                        xd_v8s16 a;
++                        if constexpr (PRE) { a = A[g]; } else { a = lda(g, 0); }
++                        const xd_v8i32 z = 0;
++                        epi(intel_sub_group_i8_i8_matrix_mad_k32(a, B, z), 0, std::integral_constant<int, 8>{});
++                    }
++                    {
++                        a2_t a;
++                        if constexpr (PRE) { a = A2[g]; } else { a = lda2(g); }
++                        const c2_t z = 0;
++                        epi(intel_sub_group_i8_i8_matrix_mad_k32(a, B, z), 1, std::integral_constant<int, T2>{});
++                    }
++                });
++#pragma unroll
++                for (int i = 0; i < MC; ++i) { F[i] += Fb[i]; }
++#pragma unroll
++                for (int j = 0; j < 8; ++j) { w[j] = wn[j]; }
++            }
++            if (ks > 1) {   // split-K reduction in SLM, fixed order (the joint_matrix MC 16 kernel's)
++#pragma unroll
++                for (int i = 0; i < MC; ++i) { red[(s * MC + i) * 16 + lane] = F[i]; }
++                sycl::group_barrier(it.get_group());
++                if (s == 0) {
++#pragma unroll
++                    for (int i = 0; i < MC; ++i) {
++                        float acc = red[i * 16 + lane];
++                        for (int t = 1; t < ks; ++t) { acc += red[(t * MC + i) * 16 + lane]; }
++                        F[i] = acc;
++                    }
++                }
++            }
++            if (s == 0) {
++#pragma unroll
++                for (int i = 0; i < MC; ++i) { if (i < M) { dOut[(size_t) i * ldd + row] = F[i]; } }
++            }
++        });
++    });
++}
++
++sycl::event ggml_sycl_xmx_q4k_direct16_launch(const uint8_t * dQs, const uint8_t * dSc, const uint32_t * dDm,
++                                              const int8_t * dXa, const sycl::half * dD8c, const int32_t * dS8c,
++                                              float * dOut, int N, int K, int M, int64_t ldd, int ks, sycl::queue & q) {
++    // GGML_SYCL_XMX_DIRECT16_PRE=0: A tiles loaded per group instead of ahead of the block's DPAS chain
++    // GGML_SYCL_XMX_DIRECT16_M4=0: 9..12 columns also run the full 8-row second tile (default: the M = 1 / 2 / 4 DPAS
++    // for 9 / 10 / 11..12 columns)
++    static const bool pre = [] {
++        const char * e = getenv("GGML_SYCL_XMX_DIRECT16_PRE");
++        return !(e && *e && atoi(e) == 0);
++    }();
++    static const bool m4 = [] {
++        const char * e = getenv("GGML_SYCL_XMX_DIRECT16_M4");
++        return !(e && *e && atoi(e) == 0);
++    }();
++    if (m4 && M == 9) {
++        return pre ? xd_q4k16<true, 1>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q) :
++                     xd_q4k16<false, 1>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q);
++    }
++    if (m4 && M == 10) {
++        return pre ? xd_q4k16<true, 2>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q) :
++                     xd_q4k16<false, 2>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q);
++    }
++    if (m4 && M <= 12) {
++        return pre ? xd_q4k16<true, 4>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q) :
++                     xd_q4k16<false, 4>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q);
++    }
++    return pre ? xd_q4k16<true, 8>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q) :
++                 xd_q4k16<false, 8>(dQs, dSc, dDm, dXa, dD8c, dS8c, dOut, N, K, M, ldd, ks, q);
++}
++
++// q6_K, 9..16 columns: xa [G][2 halves][16 columns][32] (half h of group g at g*1024 + h*512 B, column tile t at
++// +t*256 B), d8 [G][16] half (lane l's uint4 of block b = group l/2, columns 8(l%2)..+7: column 8t + i of group g is
++// component i of lane 2g + t). Per column the float operations and their order are xmx_q6k_launch_wide<16>'s:
++// lo = dot_lo * sc[2g]; Fb = fma(fma(dot_hi, sc[2g+1], lo), d8, Fb); F = fma(d/4, Fb, F).
++sycl::event ggml_sycl_xmx_q6k_direct16_launch(const uint8_t * dQl, const uint8_t * dQh, const int8_t * dSc,
++                                              const uint16_t * dD, const int8_t * dXa, const sycl::half * dD8,
++                                              float * dOut, int N, int K, int M, int64_t ldd, int ks, sycl::queue & q) {
++    const int KB = K / QK_K;
++    return q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<float, 1> red(sycl::range<1>(ks > 1 ? ks * 16 * 16 : 1), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N / 16) * ks * 16), sycl::range<1>(ks * 16)),
++                       sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
++            using sycl::access::address_space;
++            using sycl::access::decorated;
++            sycl::sub_group sg = it.get_sub_group();
++            const int lane = sg.get_local_id()[0];
++            const int s    = sg.get_group_id()[0];
++            const int row0 = (int) it.get_group(0) * 16;
++            const int b0   = s * KB / ks, b1 = (s + 1) * KB / ks;
++            const int row  = row0 + lane;
++            const sycl::uint4 * gl   = reinterpret_cast<const sycl::uint4 *>(dQl + (size_t) row * KB * 128);
++            const sycl::uint4 * gh   = reinterpret_cast<const sycl::uint4 *>(dQh + (size_t) row * KB * 64);
++            const sycl::uint4 * hsc  = reinterpret_cast<const sycl::uint4 *>(dSc + (size_t) row * KB * 16);
++            const uint16_t *    hd   = dD + (size_t) row * KB;
++            const uint16_t *    xa16 = reinterpret_cast<const uint16_t *>(dXa);
++            const sycl::uint4 * d8base = reinterpret_cast<const sycl::uint4 *>(dD8) + lane;
++            auto d8f = [](uint32_t w, int hi) -> float {
++                return (float) sycl::bit_cast<sycl::half>((uint16_t) (hi ? (w >> 16) : (w & 0xFFFF)));
++            };
++
++            sycl::uint4 wl[8], wh[4], wln[8], whn[4];
++#pragma unroll
++            for (int j = 0; j < 8; ++j) { wl[j] = gl[(size_t) b0 * 8 + j]; }
++#pragma unroll
++            for (int j = 0; j < 4; ++j) { wh[j] = gh[(size_t) b0 * 4 + j]; }
++            sycl::uint4 hs  = hsc[b0];
++            uint16_t    hdd = hd[b0];
++            sycl::uint4 d8n = d8base[(size_t) b0 * 16];
++            float F[16];
++#pragma unroll
++            for (int i = 0; i < 16; ++i) { F[i] = 0.f; }
++            for (int b = b0; b < b1; ++b) {
++                float scf[16];
++                {
++                    const uint32_t w[4] = { hs.x(), hs.y(), hs.z(), hs.w() };
++#pragma unroll
++                    for (int t = 0; t < 16; ++t) { scf[t] = (float) (int8_t) (w[t >> 2] >> (8 * (t & 3))); }
++                }
++                const float dq     = (float) sycl::bit_cast<sycl::half>(hdd) * 0.25f;   // exact
++                const float d8c[8] = { d8f(d8n.x(), 0), d8f(d8n.x(), 1), d8f(d8n.y(), 0), d8f(d8n.y(), 1),
++                                       d8f(d8n.z(), 0), d8f(d8n.z(), 1), d8f(d8n.w(), 0), d8f(d8n.w(), 1) };
++                {   // next block (clamped, unconditional)
++                    const int bn = b + 1 < b1 ? b + 1 : b;
++                    hs  = hsc[bn];
++                    hdd = hd[bn];
++                    d8n = d8base[(size_t) bn * 16];
++#pragma unroll
++                    for (int j = 0; j < 8; ++j) { wln[j] = gl[(size_t) bn * 8 + j]; }
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) { whn[j] = gh[(size_t) bn * 4 + j]; }
++                }
++                float Fb[16];
++#pragma unroll
++                for (int i = 0; i < 16; ++i) { Fb[i] = 0.f; }
++                xd_unroll(std::make_integer_sequence<int, 8>{}, [&](auto gi) {
++                    constexpr int g = decltype(gi)::value;
++                    constexpr int hh = g >> 2, t4 = g & 3;
++                    const sycl::uint4 l0 = wl[4 * hh + 2 * (t4 & 1)], l1 = wl[4 * hh + 2 * (t4 & 1) + 1];
++                    const sycl::uint4 h0 = wh[2 * hh], h1 = wh[2 * hh + 1];
++                    const xd_v8i32 B = { (int) xd_q6k_stage<t4>(l0.x(), h0.x()), (int) xd_q6k_stage<t4>(l0.y(), h0.y()),
++                                         (int) xd_q6k_stage<t4>(l0.z(), h0.z()), (int) xd_q6k_stage<t4>(l0.w(), h0.w()),
++                                         (int) xd_q6k_stage<t4>(l1.x(), h1.x()), (int) xd_q6k_stage<t4>(l1.y(), h1.y()),
++                                         (int) xd_q6k_stage<t4>(l1.z(), h1.z()), (int) xd_q6k_stage<t4>(l1.w(), h1.w()) };
++#pragma unroll
++                    for (int t = 0; t < 2; ++t) {
++                        xd_v8s16 alo, ahi;
++                        {
++                            const auto av = sg.load<8>(sycl::address_space_cast<address_space::global_space, decorated::yes>(
++                                xa16 + (size_t) (b * 8 + g) * 512 + t * 128));
++#pragma unroll
++                            for (int m = 0; m < 8; ++m) { alo[m] = (short) av[m]; }
++                        }
++                        {
++                            const auto av = sg.load<8>(sycl::address_space_cast<address_space::global_space, decorated::yes>(
++                                xa16 + (size_t) (b * 8 + g) * 512 + 256 + t * 128));
++#pragma unroll
++                            for (int m = 0; m < 8; ++m) { ahi[m] = (short) av[m]; }
++                        }
++                        const xd_v8i32 z   = 0;
++                        const xd_v8i32 clo = intel_sub_group_i8_i8_matrix_mad_k32(alo, B, z);
++                        const xd_v8i32 chi = intel_sub_group_i8_i8_matrix_mad_k32(ahi, B, z);
++                        float db[8];
++#pragma unroll
++                        for (int i = 0; i < 8; ++i) { db[i] = sycl::select_from_group(sg, d8c[i], 2 * g + t); }
++#pragma unroll
++                        for (int i = 0; i < 8; ++i) {
++                            const float lo = (float) clo[i] * scf[2 * g];
++                            Fb[t * 8 + i] = sycl::fma(sycl::fma((float) chi[i], scf[2 * g + 1], lo), db[i], Fb[t * 8 + i]);
++                        }
++                    }
++                });
++#pragma unroll
++                for (int i = 0; i < 16; ++i) { F[i] = sycl::fma(dq, Fb[i], F[i]); }
++#pragma unroll
++                for (int j = 0; j < 8; ++j) { wl[j] = wln[j]; }
++#pragma unroll
++                for (int j = 0; j < 4; ++j) { wh[j] = whn[j]; }
++            }
++            if (ks > 1) {
++#pragma unroll
++                for (int i = 0; i < 16; ++i) { red[(s * 16 + i) * 16 + lane] = F[i]; }
++                sycl::group_barrier(it.get_group());
++                if (s == 0) {
++#pragma unroll
++                    for (int i = 0; i < 16; ++i) {
++                        float acc = red[i * 16 + lane];
++                        for (int t = 1; t < ks; ++t) { acc += red[(t * 16 + i) * 16 + lane]; }
++                        F[i] = acc;
++                    }
++                }
++            }
++            if (s == 0) {
++#pragma unroll
++                for (int i = 0; i < 16; ++i) { if (i < M) { dOut[(size_t) i * ldd + row] = F[i]; } }
++            }
++        });
++    });
++}
+diff --git a/ggml/src/ggml-sycl/mmq-xmx-direct.hpp b/ggml/src/ggml-sycl/mmq-xmx-direct.hpp
+index 1b5f38359b..3078a9800e 100644
+--- a/ggml/src/ggml-sycl/mmq-xmx-direct.hpp
++++ b/ggml/src/ggml-sycl/mmq-xmx-direct.hpp
+@@ -23,4 +23,15 @@ sycl::event ggml_sycl_xmx_q6k_direct_launch(const uint8_t * ql, const uint8_t *
+                                             const int8_t * xa, const sycl::half * d8, float * out, int N, int K, int M,
+                                             int64_t ldd, int ks, sycl::queue & q);
+ 
++// LOCAL (wideverify): 9..16 columns (two A tiles on every register-built B operand). q4_K: the same operand layouts as
++// the 1..8 kernel (xa [G][16][32] already holds 16 columns). q6_K: xa [G][2][16][32] int8 (half-group tiles of 16
++// columns each), d8 [G][16] half. Per column the float operations and their order are the two-tile joint_matrix
++// kernels' (xmx_q4k_launch<16> / xmx_q6k_launch_wide<16>), so the outputs are bit-identical to them at the same ks.
++sycl::event ggml_sycl_xmx_q4k_direct16_launch(const uint8_t * qs, const uint8_t * sc, const uint32_t * dm, const int8_t * xa,
++                                              const sycl::half * d8, const int32_t * us, float * out, int N, int K, int M,
++                                              int64_t ldd, int ks, sycl::queue & q);
++sycl::event ggml_sycl_xmx_q6k_direct16_launch(const uint8_t * ql, const uint8_t * qh, const int8_t * sc, const uint16_t * dd,
++                                              const int8_t * xa, const sycl::half * d8, float * out, int N, int K, int M,
++                                              int64_t ldd, int ks, sycl::queue & q);
++
+ #endif // GGML_SYCL_MMQ_XMX_DIRECT_HPP
+diff --git a/ggml/src/ggml-sycl/mmq-xmx-q4k.cpp b/ggml/src/ggml-sycl/mmq-xmx-q4k.cpp
+index c9aa3e90e6..1bc484c724 100644
+--- a/ggml/src/ggml-sycl/mmq-xmx-q4k.cpp
++++ b/ggml/src/ggml-sycl/mmq-xmx-q4k.cpp
+@@ -11,6 +11,7 @@
+ #include "mmq-xmx-q4k.hpp"
+ #include "mmq-dnn-u4.hpp"
+ #include "mmq-xmx-direct.hpp"
++#include "mmq-xmx-q80.hpp"   // ggml_sycl_xmx_direct_wide (LOCAL wideverify)
+ #include "quants.hpp"
+ #include "quantize.hpp"
+ 
+@@ -663,7 +664,9 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
+     // register-fed DPAS kernel for 1..8 columns (GGML_SYCL_XMX_Q4K_DIRECT=1): same partition (split-K) and operation
+     // order as xmx_q4k_matmul, so bit-identical; very tall weights (a 98k-row draft head, where the rule of thumb gives
+     // ks = 1) get ks 5: 530 -> 493 us on 98304x5120, not bit-identical to ks 1 there (float order of 5 partial sums)
+-    const bool direct = ggml_sycl_xmx_q4k_direct_env() && M <= 8;
++    // LOCAL (wideverify): 9..16 columns on the two-tile register-fed kernel with GGML_SYCL_XMX_WIDE=1 (the same
++    // partition and per-column operation order as xmx_q4k_launch<16>, so bit-identical to it at the same ks)
++    const bool direct = ggml_sycl_xmx_q4k_direct_env() && (M <= 8 || ggml_sycl_xmx_direct_wide());
+     std::vector<sycl::event> ev;
+     ev.push_back(xmx_q4k_quant_act(x, xa, d8, us, (int) K, (int) M, *q, direct));
+     if (checkq && !direct) {
+@@ -674,8 +677,17 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
+         if (N >= 65536 && ks < 5) {
+             ks = std::max(1, std::min(5, (int) (K / QK_K) / 4));
+         }
+-        ev.push_back(ggml_sycl_xmx_q4k_direct_launch(w.qs, w.sc, w.dm, xa, d8, us, out, (int) N, (int) K, (int) M,
+-                                                     dst->ne[0], ks, *q));
++        if (M > 8) {
++            static const int ks16_env = ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_Q4K_DIRECT16_KS", 0);   // tuning only
++            if (ks16_env > 0) {
++                ks = std::max(1, std::min(ks16_env, std::min(16, (int) (K / QK_K))));
++            }
++            ev.push_back(ggml_sycl_xmx_q4k_direct16_launch(w.qs, w.sc, w.dm, xa, d8, us, out, (int) N, (int) K, (int) M,
++                                                           dst->ne[0], ks, *q));
++        } else {
++            ev.push_back(ggml_sycl_xmx_q4k_direct_launch(w.qs, w.sc, w.dm, xa, d8, us, out, (int) N, (int) K, (int) M,
++                                                         dst->ne[0], ks, *q));
++        }
+         // GGML_SYCL_XMX_Q4K_DIRECT_CHECK=1 (measurement only, synchronous): rerun the op on the joint_matrix kernel
+         // (same split-K) and compare every output bit for bit
+         static const bool dcheck = ggml_sycl_xmx_q4k_env_int("GGML_SYCL_XMX_Q4K_DIRECT_CHECK", 0) != 0;
+@@ -686,7 +698,11 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
+             sycl::half * rd8 = reinterpret_cast<sycl::half *>(ref_act.get() + xa_bytes);
+             int32_t *    rus = reinterpret_cast<int32_t *>(ref_act.get() + xa_bytes + d8_bytes);
+             xmx_q4k_quant_act(x, rxa, rd8, rus, (int) K, (int) M, *q, false);
+-            xmx_q4k_launch<8, 256>(w.qs, w.sc, w.dm, rxa, rd8, rus, ref_out.get(), (int) N, (int) K, (int) M, N, ks, *q);
++            if (M > 8) {
++                xmx_q4k_launch<16, 256>(w.qs, w.sc, w.dm, rxa, rd8, rus, ref_out.get(), (int) N, (int) K, (int) M, N, ks, *q);
++            } else {
++                xmx_q4k_launch<8, 256>(w.qs, w.sc, w.dm, rxa, rd8, rus, ref_out.get(), (int) N, (int) K, (int) M, N, ks, *q);
++            }
+             q->wait();
+             std::vector<float> a((size_t) M * N), r((size_t) M * N);
+             for (int64_t i = 0; i < M; ++i) {
+@@ -710,7 +726,7 @@ void ggml_sycl_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tenso
+     }
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ void ggml_sycl_op_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+@@ -750,7 +766,7 @@ void ggml_sycl_op_mul_mat_xmx_q4k(ggml_backend_sycl_context & ctx, const ggml_te
+     xmx_q4k_matmul(w, xa, d8, us, dst_dd_i, (int) N, (int) K, (int) M, dst->ne[0], *stream);
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ #else  // !GGML_SYCL_XMX
+diff --git a/ggml/src/ggml-sycl/mmq-xmx-q6k.cpp b/ggml/src/ggml-sycl/mmq-xmx-q6k.cpp
+index 0a3154f231..81c61ed8cb 100644
+--- a/ggml/src/ggml-sycl/mmq-xmx-q6k.cpp
++++ b/ggml/src/ggml-sycl/mmq-xmx-q6k.cpp
+@@ -7,6 +7,7 @@
+ #include "mmq-xmx-q6k.hpp"
+ #include "mmq-xmx-q4k.hpp"
+ #include "mmq-xmx-direct.hpp"
++#include "mmq-xmx-q80.hpp"
+ #include "quants.hpp"
+ #include "quantize.hpp"
+ 
+@@ -39,9 +40,11 @@ bool ggml_sycl_xmx_q6k_direct_env() {
+     return v;
+ }
+ 
+-// kernel tile: 16 weight rows per sub-group, up to 8 activation columns (the A tile's M)
++// kernel tile: 16 weight rows per sub-group, up to 8 activation columns (the A tile's M); LOCAL (longdraft): a second
++// kernel instance runs two A tiles (9..16 columns) against every staged B tile, opt-in (GGML_SYCL_XMX_WIDE=1 or
++// GGML_SYCL_XMX_Q6K_MAX_COLS=9..16); 1..8 columns keep the one-tile kernel unchanged
+ static constexpr int XMX_Q6K_ROWS     = 16;
+-static constexpr int XMX_Q6K_MAX_COLS = 8;
++static constexpr int XMX_Q6K_MAX_COLS = 16;
+ 
+ static int ggml_sycl_xmx_q6k_min_cols() {
+     // direct kernel (GGML_SYCL_XMX_Q6K_DIRECT=1): 2, for weights of at least BIG_MB only (see can_use)
+@@ -51,7 +54,9 @@ static int ggml_sycl_xmx_q6k_min_cols() {
+ }
+ 
+ static int ggml_sycl_xmx_q6k_max_cols() {
+-    static const int v = std::min(XMX_Q6K_MAX_COLS, ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_MAX_COLS", 8));
++    // the legacy driver path (GGML_SYCL_XMX_Q6K_PATH=1) only has the one-tile kernel
++    static const int v = std::min(ggml_sycl_xmx_q6k_path() == 0 ? XMX_Q6K_MAX_COLS : 8,
++                                  ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_MAX_COLS", ggml_sycl_xmx_wide() ? 16 : 8));
+     return v;
+ }
+ 
+@@ -105,11 +110,14 @@ bool ggml_sycl_xmx_q6k_can_use(ggml_backend_sycl_context & ctx, const ggml_tenso
+         dst->ne[0] != src0->ne[1] || ggml_nbytes(src0) >= (size_t) INT_MAX) {   // reorder offset helpers use int
+         return false;
+     }
+-    // minimum work (see the guards above): small weights, and mid-size weights at few columns, are faster on MMVQ
+-    if (ggml_nbytes(src0) < ggml_sycl_xmx_q6k_min_bytes()) {
++    // minimum work (see the guards above): small weights, and mid-size weights at few columns, are faster on MMVQ.
++    // Above 8 columns MMVQ is out of reach (MMVQ_MAX_BATCH_SIZE) and the alternative is dequantize + f16 GEMM, so the
++    // guards only apply up to 8 columns.
++    if (src1->ne[1] <= 8 && ggml_nbytes(src0) < ggml_sycl_xmx_q6k_min_bytes()) {
+         return false;
+     }
+-    if (ggml_nbytes(src0) < ggml_sycl_xmx_q6k_big_bytes() && src1->ne[1] < ggml_sycl_xmx_q6k_small_min_cols()) {
++    if (src1->ne[1] <= 8 && ggml_nbytes(src0) < ggml_sycl_xmx_q6k_big_bytes() &&
++        src1->ne[1] < ggml_sycl_xmx_q6k_small_min_cols()) {
+         return false;
+     }
+     // direct kernel at 2 columns: only weights of at least BIG_MB (5120x17408 ffn_down: MMVQ 152.0 vs direct 140.9 us)
+@@ -139,7 +147,7 @@ namespace imx = sycl::ext::intel::experimental::matrix;
+ namespace {
+ 
+ constexpr int X6_TM = 8, X6_TN = 16, X6_TK = 32, X6_SG = 16;
+-constexpr int X6_MC = XMX_Q6K_MAX_COLS;   // columns the kernel is specialised for
++constexpr int X6_MC = 8;                  // columns of the one-tile kernel (MC = 16: two A tiles)
+ constexpr int X6_PB = 128;                // SLM bytes per row per staged part (half a block)
+ 
+ // Activation pack from the driver's SoA q8_1 buffer (quantize_and_reorder_q8_1_soa): column c starts at
+@@ -184,6 +192,9 @@ void xmx_q6k_pack_act(const char * y, size_t stride_y, int8_t * xa, sycl::half *
+ // Columns >= M are left unwritten: they only feed accumulator rows the kernel never stores (integer DPAS, per-row).
+ // gmajor: xa in the direct kernel's group-major layout [G][2 tiles][8 columns][32]: tile 0 = elements 0..15 then 16
+ // zeros, tile 1 = 16 zeros then elements 16..31 (the same two A tiles, 512 B per group, one block read each)
++// DC: columns per d8 row (8 for the one-tile kernel; 16 for the two-tile kernel, LOCAL longdraft). With DC = 16 the
++// group-major layout is [G][2][16][32] (LOCAL wideverify, the 9..16-column register-fed kernel); DC = 8 is unchanged.
++template <int DC = X6_TM>
+ sycl::event xmx_q6k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int K, int M, sycl::queue & q,
+                               bool gmajor = false) {
+     constexpr int EPW = QK8_1 / WARP_SIZE;
+@@ -201,9 +212,9 @@ sycl::event xmx_q6k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int
+         const int    lane = (int) it.get_local_id(0);
+         const int    e    = lane * EPW;        // this lane's first element of the group
+         if (gmajor) {
+-            int8_t * dst = xa + (size_t) g * 512 + (size_t) c * 32;
+-            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? 0 : 256) + e) = qv;
+-            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? 256 : 0) + e) = sycl::vec<int8_t, EPW>(0);
++            int8_t * dst = xa + (size_t) g * (DC * 64) + (size_t) c * 32;
++            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? 0 : DC * 32) + e) = qv;
++            *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + (e < 16 ? DC * 32 : 0) + e) = sycl::vec<int8_t, EPW>(0);
+         } else {
+             int8_t * dst = xa + (size_t) c * 2 * K + (size_t) g * 64;
+             // elements 0..15 at +0, 16..31 at +48; bytes 16..47 zero (EPW per lane covers 32 bytes over the sub-group)
+@@ -211,7 +222,7 @@ sycl::event xmx_q6k_quant_act(const float * x, int8_t * xa, sycl::half * d8, int
+             *reinterpret_cast<sycl::vec<int8_t, EPW> *>(dst + 16 + e) = sycl::vec<int8_t, EPW>(0);
+         }
+         if (lane == 0) {
+-            d8[(size_t) g * X6_TM + c] = sycl::half(d);
++            d8[(size_t) g * DC + c] = sycl::half(d);
+         }
+     });
+ }
+@@ -441,6 +452,193 @@ sycl::event xmx_q6k_launch(const uint8_t * dQl, const uint8_t * dQh, const int8_
+     });
+ }
+ 
++// LOCAL (longdraft): the kernel above as a template on the column count; instantiated only for MC = 16 (9..16
++// columns), so the 1..8-column kernel stays the unmodified one-tile code
++template <int MC>
++sycl::event xmx_q6k_launch_wide(const uint8_t * dQl, const uint8_t * dQh, const int8_t * dSc, const uint16_t * dD,
++                           const int8_t * dXa, const sycl::half * dD8, float * dOut, int N, int K, int M, int64_t ldd,
++                           int ks, sycl::queue & q) {
++    // MC = 8: one A tile (columns 0..7), d8 [G][8]. MC = 16 (LOCAL longdraft): two A tiles (columns 0..7, 8..15) on
++    // every staged B tile, xa [16][2K], d8 [G][16]; per column the float operations and their order are the MC = 8
++    // kernel's.
++    static_assert(MC == 8 || MC == 16, "one or two A tiles");
++    constexpr int NT = MC / X6_TM;
++    const int KB = K / QK_K;
++    return q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<int8_t, 1> bslm(sycl::range<1>(ks * 16 * X6_PB), h);
++        sycl::local_accessor<float, 1>  red(sycl::range<1>(ks > 1 ? ks * MC * 16 : 1), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N / 16) * ks * X6_SG), sycl::range<1>(ks * X6_SG)),
++                       sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(X6_SG)]] {
++            using sycl::access::address_space;
++            using sycl::access::decorated;
++            sycl::sub_group sg = it.get_sub_group();
++            const int lane = sg.get_local_id()[0];
++            const int s    = sg.get_group_id()[0];
++            const int row0 = (int) it.get_group(0) * 16;
++            const int b0   = s * KB / ks, b1 = (s + 1) * KB / ks;
++            auto bp = bslm.get_multi_ptr<decorated::no>() + s * 16 * X6_PB;
++
++            const int j  = lane & 1;
++            const int ra = lane >> 1;                   // unit 0 row; unit 1 row = ra + 8
++            const uint8_t * gl = dQl + (size_t) (row0 + ra) * KB * 128 + j * 16;
++            const uint8_t * gh = dQh + (size_t) (row0 + ra) * KB * 64 + j * 16;
++            const size_t    rl = (size_t) 8 * KB * 128, rh = (size_t) 8 * KB * 64;   // +8 rows
++            const int       so = ra * X6_PB + j * 16;
++            const sycl::uint4 * hsc = reinterpret_cast<const sycl::uint4 *>(dSc + (size_t) (row0 + lane) * KB * 16);
++            const uint16_t *    hd  = dD + (size_t) (row0 + lane) * KB;
++            const int8_t *      xa  = dXa;
++            // MC 8:  d8 [G][8] half: lane l's 4 halves (one uint2) of block b = group l/2, columns 4(l%2)..+3; column i
++            //        of group g is component i%4 of lane 2g + i/4
++            // MC 16: d8 [G][16] half: lane l's 8 halves (one uint4) = group l/2, columns 8(l%2)..+7; column 8t + i of
++            //        group g is component i of lane 2g + t
++            using d8v_t = std::conditional_t<MC == 8, sycl::uint2, sycl::uint4>;
++            constexpr int ND8 = MC == 8 ? 4 : 8;
++            const d8v_t * d8base = reinterpret_cast<const d8v_t *>(dD8) + lane;
++            auto d8f = [](uint32_t w, int hi) -> float {
++                return (float) sycl::bit_cast<sycl::half>((uint16_t) (hi ? (w >> 16) : (w & 0xFFFF)));
++            };
++
++            auto ldq = [](const uint8_t * p) -> sycl::uint4 { return *reinterpret_cast<const sycl::uint4 *>(p); };
++            sycl::uint4 va[2], vb[2], vh[2];            // next part: ql run a, ql run b, qh, per unit
++#pragma unroll
++            for (int u = 0; u < 2; ++u) {
++                va[u] = ldq(gl + u * rl + b0 * 128);
++                vb[u] = ldq(gl + u * rl + b0 * 128 + 32);
++                vh[u] = ldq(gh + u * rh + b0 * 64);
++            }
++            sycl::uint4  hs  = hsc[b0];
++            uint16_t     hdd = hd[b0];
++            d8v_t        d8n = d8base[(size_t) b0 * 16];
++
++            float F[MC];
++            for (int i = 0; i < MC; ++i) { F[i] = 0.f; }
++            for (int b = b0; b < b1; ++b) {
++                float scf[16];
++                {
++                    const uint32_t w[4] = { hs.x(), hs.y(), hs.z(), hs.w() };
++#pragma unroll
++                    for (int t = 0; t < 16; ++t) { scf[t] = (float) (int8_t) (w[t >> 2] >> (8 * (t & 3))); }
++                }
++                const float dq = (float) sycl::bit_cast<sycl::half>(hdd) * 0.25f;   // exact
++                float d8c[ND8];
++                if constexpr (MC == 8) {
++                    d8c[0] = d8f(d8n.x(), 0); d8c[1] = d8f(d8n.x(), 1); d8c[2] = d8f(d8n.y(), 0); d8c[3] = d8f(d8n.y(), 1);
++                } else {
++                    d8c[0] = d8f(d8n.x(), 0); d8c[1] = d8f(d8n.x(), 1); d8c[2] = d8f(d8n.y(), 0); d8c[3] = d8f(d8n.y(), 1);
++                    d8c[4] = d8f(d8n.z(), 0); d8c[5] = d8f(d8n.z(), 1); d8c[6] = d8f(d8n.w(), 0); d8c[7] = d8f(d8n.w(), 1);
++                }
++                {   // next block's header (clamped, unconditional)
++                    const int bn = b + 1 < b1 ? b + 1 : b;
++                    hs  = hsc[bn];
++                    hdd = hd[bn];
++                    d8n = d8base[(size_t) bn * 16];
++                }
++                float Fb[MC];
++#pragma unroll
++                for (int i = 0; i < MC; ++i) { Fb[i] = 0.f; }
++#pragma unroll
++                for (int part = 0; part < 2; ++part) {
++#pragma unroll
++                    for (int u = 0; u < 2; ++u) {
++                        sycl::uint4 o0, o1, o2, o3;
++                        o0.x() = xmx_q6k_stage<0>(va[u].x(), vh[u].x()); o0.y() = xmx_q6k_stage<0>(va[u].y(), vh[u].y());
++                        o0.z() = xmx_q6k_stage<0>(va[u].z(), vh[u].z()); o0.w() = xmx_q6k_stage<0>(va[u].w(), vh[u].w());
++                        o1.x() = xmx_q6k_stage<1>(vb[u].x(), vh[u].x()); o1.y() = xmx_q6k_stage<1>(vb[u].y(), vh[u].y());
++                        o1.z() = xmx_q6k_stage<1>(vb[u].z(), vh[u].z()); o1.w() = xmx_q6k_stage<1>(vb[u].w(), vh[u].w());
++                        o2.x() = xmx_q6k_stage<2>(va[u].x(), vh[u].x()); o2.y() = xmx_q6k_stage<2>(va[u].y(), vh[u].y());
++                        o2.z() = xmx_q6k_stage<2>(va[u].z(), vh[u].z()); o2.w() = xmx_q6k_stage<2>(va[u].w(), vh[u].w());
++                        o3.x() = xmx_q6k_stage<3>(vb[u].x(), vh[u].x()); o3.y() = xmx_q6k_stage<3>(vb[u].y(), vh[u].y());
++                        o3.z() = xmx_q6k_stage<3>(vb[u].z(), vh[u].z()); o3.w() = xmx_q6k_stage<3>(vb[u].w(), vh[u].w());
++                        const int o = so + u * 8 * X6_PB;
++                        *reinterpret_cast<sycl::uint4 *>(&bp[o])      = o0;
++                        *reinterpret_cast<sycl::uint4 *>(&bp[o + 32]) = o1;
++                        *reinterpret_cast<sycl::uint4 *>(&bp[o + 64]) = o2;
++                        *reinterpret_cast<sycl::uint4 *>(&bp[o + 96]) = o3;
++                    }
++                    {   // prefetch the next part (clamped, unconditional: no phi copies)
++                        const int nb = part + 1 < 2 ? b : (b + 1 < b1 ? b + 1 : b);
++                        const int np = part + 1 < 2 ? part + 1 : (b + 1 < b1 ? 0 : part);
++#pragma unroll
++                        for (int u = 0; u < 2; ++u) {
++                            va[u] = ldq(gl + u * rl + nb * 128 + np * 64);
++                            vb[u] = ldq(gl + u * rl + nb * 128 + np * 64 + 32);
++                            vh[u] = ldq(gh + u * rh + nb * 64 + np * 32);
++                        }
++                    }
++                    sycl::group_barrier(sg);
++#pragma unroll
++                    for (int gg = 0; gg < 4; ++gg) {
++                        const int g = part * 4 + gg;
++                        mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, X6_TK, X6_TN, mx::layout::col_major> B;
++                        mx::joint_matrix_load(sg, B, bp + gg * X6_TK, X6_PB);
++#pragma unroll
++                        for (int t = 0; t < NT; ++t) {
++                            mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, X6_TM, X6_TK, mx::layout::row_major> Alo, Ahi;
++                            const int8_t * xg = xa + (size_t) t * X6_TM * 2 * K + (size_t) (b * 8 + g) * 64;
++                            mx::joint_matrix_load(sg, Alo, sycl::address_space_cast<address_space::global_space, decorated::no>(xg), 2 * K);
++                            mx::joint_matrix_load(sg, Ahi, sycl::address_space_cast<address_space::global_space, decorated::no>(xg + 32), 2 * K);
++                            mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, X6_TM, X6_TN> Clo, Chi;
++                            mx::joint_matrix_fill(sg, Clo, 0);
++                            mx::joint_matrix_fill(sg, Chi, 0);
++                            mx::joint_matrix_mad(sg, Clo, Alo, B, Clo);
++                            mx::joint_matrix_mad(sg, Chi, Ahi, B, Chi);
++                            // column-side d8 broadcast (register regions); these sub-group ops must stay outside the
++                            // joint_matrix_apply lambdas
++                            float db[8];
++#pragma unroll
++                            for (int i = 0; i < 8; ++i) {
++                                if constexpr (MC == 8) {
++                                    db[i] = sycl::select_from_group(sg, d8c[i & 3], 2 * g + (i >> 2));
++                                } else {
++                                    db[i] = sycl::select_from_group(sg, d8c[i], 2 * g + t);
++                                }
++                            }
++                            float lo[8];
++                            {
++                                int i = 0;
++                                imx::joint_matrix_apply(sg, Clo, [&](int32_t & v, size_t, size_t) {
++                                    if (i < 8) { lo[i] = (float) v * scf[2 * g]; }
++                                    ++i;
++                                });
++                            }
++                            {
++                                int i = 0;
++                                imx::joint_matrix_apply(sg, Chi, [&](int32_t & v, size_t, size_t) {
++                                    if (i < 8) { Fb[t * 8 + i] = sycl::fma(sycl::fma((float) v, scf[2 * g + 1], lo[i]), db[i], Fb[t * 8 + i]); }
++                                    ++i;
++                                });
++                            }
++                        }
++                    }
++                    sycl::group_barrier(sg);
++                }
++#pragma unroll
++                for (int i = 0; i < MC; ++i) { F[i] = sycl::fma(dq, Fb[i], F[i]); }
++            }
++            if (ks > 1) {
++#pragma unroll
++                for (int i = 0; i < MC; ++i) { red[(s * MC + i) * 16 + lane] = F[i]; }
++                sycl::group_barrier(it.get_group());
++                if (s == 0) {
++#pragma unroll
++                    for (int i = 0; i < MC; ++i) {
++                        float acc = red[i * 16 + lane];
++                        for (int t = 1; t < ks; ++t) { acc += red[(t * MC + i) * 16 + lane]; }
++                        F[i] = acc;
++                    }
++                }
++            }
++            if (s == 0) {
++#pragma unroll
++                for (int i = 0; i < MC; ++i) {
++                    if (i < M) { dOut[(size_t) i * ldd + row0 + lane] = F[i]; }
++                }
++            }
++        });
++    });
++}
++
+ // GGML_SYCL_XMX_Q6K_CHECKQ=1: compare the fused quantizer's operands (columns < M) with the legacy quantize + pack
+ void xmx_q6k_checkq(const float * x, const int8_t * xa, const sycl::half * d8, int K, int M,
+                     ggml_backend_sycl_context & ctx, sycl::queue & q) {
+@@ -503,12 +701,75 @@ void ggml_sycl_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx, const ggml_tenso
+     const int64_t G = K / QK8_1;
+     GGML_ASSERT(src1->ne[0] == K && dst->ne[0] == N && dst->ne[1] == M);
+     GGML_ASSERT(K % QK_K == 0 && N % XMX_Q6K_ROWS == 0);
+-    GGML_ASSERT(M >= 1 && M <= X6_MC);
++    GGML_ASSERT(M >= 1 && M <= XMX_Q6K_MAX_COLS);
+     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+     GGML_ASSERT(extra && extra->optimized_feature.reorder);
+ 
+     const xmx_q6k_weights w = xmx_q6k_weights_of(static_cast<const char *>(src0->data), N, K);
+ 
++    if (M > X6_MC) {
++        // LOCAL (longdraft): 9..16 columns, two A tiles: xa [16][2K], d8 [G][16]
++        const size_t xa16 = (size_t) 2 * X6_TM * 2 * K;
++        const size_t d816 = (size_t) G * 2 * X6_TM * sizeof(sycl::half);
++        ggml_sycl_pool_alloc<char> act16(ctx.pool(), xa16 + d816);
++        int8_t *     xa = reinterpret_cast<int8_t *>(act16.get());
++        sycl::half * d8 = reinterpret_cast<sycl::half *>(act16.get() + xa16);
++        sycl::queue & q = *ctx.stream();
++        static const int ks16 = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_KS16", 0);
++        // LOCAL (wideverify): the register-fed two-tile kernel (GGML_SYCL_XMX_Q6K_DIRECT=1 + GGML_SYCL_XMX_WIDE=1),
++        // activations in the group-major [G][2][16][32] layout; same per-column math and order as the joint_matrix
++        // two-tile kernel, bit-identical to it at the same ks. Split-K: the 1..8 register-fed kernel's rule. Not for
++        // ffn_down-like shapes (>= 64 blocks per row, <= 8192 rows), where the joint_matrix kernel is faster at 9..16
++        // columns (B70, test-backend-ops perf, 5120x17408, us at 9 / 16 columns: joint_matrix ks 3 ~165; register-fed
++        // ks 16 187 / 190, ks 10 230 / 235, ks 3 244 / 220); GGML_SYCL_XMX_Q6K_DIRECT16_ALL=1 takes them too.
++        static const bool d16_all = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_DIRECT16_ALL", 0) != 0;
++        const bool direct16 = ggml_sycl_xmx_q6k_direct_env() && ggml_sycl_xmx_direct_wide() &&
++                              (d16_all || !((K / QK_K) >= 64 && N <= 8192));
++        const float * x = static_cast<const float *>(src1->data);
++        xmx_q6k_quant_act<2 * X6_TM>(x, xa, d8, (int) K, (int) M, q, direct16);
++        int ks = xmx_q6k_pick_ks((int) N, (int) K);
++        if (direct16) {
++            static const int ks_env = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_DIRECT_KS", -1);
++            if (ks_env < 0 && (K / QK_K) >= 64 && N <= 8192) {
++                ks = 16;
++            } else if (ks_env > 0) {
++                ks = std::min(ks_env, (int) (K / QK_K));
++            }
++        }
++        if (ks16 > 0) {
++            ks = std::max(1, std::min(ks16, std::min(16, (int) (K / QK_K))));
++        }
++        if (direct16) {
++            ggml_sycl_xmx_q6k_direct16_launch(w.ql, w.qh, w.sc, w.dd, xa, d8, static_cast<float *>(dst->data), (int) N,
++                                              (int) K, (int) M, dst->ne[0], ks, q);
++            static const bool dcheck = ggml_sycl_xmx_q6k_env_int("GGML_SYCL_XMX_Q6K_DIRECT_CHECK", 0) != 0;
++            if (dcheck) {   // measurement only (synchronous): the joint_matrix two-tile kernel at the same ks, bit for bit
++                ggml_sycl_pool_alloc<char>  ref_act(ctx.pool(), xa16 + d816);
++                ggml_sycl_pool_alloc<float> ref_out(ctx.pool(), (size_t) M * N);
++                int8_t *     rxa = reinterpret_cast<int8_t *>(ref_act.get());
++                sycl::half * rd8 = reinterpret_cast<sycl::half *>(ref_act.get() + xa16);
++                xmx_q6k_quant_act<2 * X6_TM>(x, rxa, rd8, (int) K, (int) M, q, false);
++                xmx_q6k_launch_wide<2 * X6_TM>(w.ql, w.qh, w.sc, w.dd, rxa, rd8, ref_out.get(), (int) N, (int) K, (int) M,
++                                               N, ks, q);
++                q.wait();
++                std::vector<float> a((size_t) M * N), r((size_t) M * N);
++                const float * out = static_cast<const float *>(dst->data);
++                for (int64_t i = 0; i < M; ++i) {
++                    q.memcpy(a.data() + i * N, out + i * dst->ne[0], N * sizeof(float));
++                }
++                q.memcpy(r.data(), ref_out.get(), r.size() * sizeof(float)).wait();
++                size_t nd = 0;
++                for (size_t i = 0; i < a.size(); ++i) { nd += memcmp(&a[i], &r[i], sizeof(float)) != 0; }
++                fprintf(stderr, "XMXDIRECTCHECK q6_K N=%lld K=%lld M=%lld ks=%d: %s (%zu of %zu differ)\n", (long long) N,
++                        (long long) K, (long long) M, ks, nd == 0 ? "IDENTICAL" : "MISMATCH", nd, a.size());
++            }
++            return;
++        }
++        xmx_q6k_launch_wide<2 * X6_TM>(w.ql, w.qh, w.sc, w.dd, xa, d8, static_cast<float *>(dst->data), (int) N,
++                                       (int) K, (int) M, dst->ne[0], ks, q);
++        return;
++    }
++
+     const size_t xa_bytes = (size_t) X6_TM * 2 * K;
+     const size_t d8_bytes = (size_t) G * X6_TM * sizeof(sycl::half);
+     ggml_sycl_pool_alloc<char> act_alloc(ctx.pool(), xa_bytes + d8_bytes);
+@@ -567,7 +828,7 @@ void ggml_sycl_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx, const ggml_tenso
+     }
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ void ggml_sycl_op_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx,const ggml_tensor * src0, const ggml_tensor * src1,
+@@ -606,7 +867,7 @@ void ggml_sycl_op_mul_mat_xmx_q6k(ggml_backend_sycl_context & ctx,const ggml_ten
+                    xmx_q6k_pick_ks((int) N, (int) K), *stream);
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ #else  // !GGML_SYCL_XMX
+diff --git a/ggml/src/ggml-sycl/mmq-xmx-q80.cpp b/ggml/src/ggml-sycl/mmq-xmx-q80.cpp
+index 87709f1244..7c8b0eae3e 100644
+--- a/ggml/src/ggml-sycl/mmq-xmx-q80.cpp
++++ b/ggml/src/ggml-sycl/mmq-xmx-q80.cpp
+@@ -35,7 +35,24 @@ static bool ggml_sycl_xmx_q80_env() {
+ }
+ 
+ static constexpr int XMX_Q80_ROWS     = 16;
+-static constexpr int XMX_Q80_MAX_COLS = 8;
++static constexpr int XMX_Q80_MAX_COLS = 8;    // the one-tile kernel
++static constexpr int XMX_Q80_WIDE_COLS = 16;  // LOCAL (longdraft): the two-tile kernel, 9..16 columns (opt-in)
++
++bool ggml_sycl_xmx_wide() {
++    // GGML_SYCL_XMX_WIDE=1 (LOCAL longdraft, default off): the XMX q6_K / q8_0 matmuls and the XMX flash attention take
++    // 9..16 columns (speculative verify batches of up to 16 tokens) instead of stopping at 8; 1..8 unchanged
++    static const bool v = ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_WIDE", 0) != 0;
++    return v;
++}
++
++bool ggml_sycl_xmx_direct_wide() {
++    // LOCAL (wideverify): with GGML_SYCL_XMX_WIDE=1, the register-fed q4_K / q6_K kernels (GGML_SYCL_XMX_Q4K_DIRECT /
++    // GGML_SYCL_XMX_Q6K_DIRECT) also serve 9..16 columns (two A tiles per staged B operand, bit-identical to the
++    // two-tile joint_matrix kernels at the same split-K). GGML_SYCL_XMX_DIRECT_WIDE=0 keeps 9..16 on the joint_matrix
++    // kernels (for A/B). Without WIDE this is always off.
++    static const bool v = ggml_sycl_xmx_wide() && ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_DIRECT_WIDE", 1) != 0;
++    return v;
++}
+ static constexpr int XMX_Q80_SB       = 256;   // elements per staged super-block (2 parts x 4 groups)
+ 
+ bool ggml_sycl_xmx_q80_can_use(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+@@ -54,7 +71,8 @@ bool ggml_sycl_xmx_q80_can_use(ggml_backend_sycl_context & ctx, const ggml_tenso
+         return false;
+     }
+     static const int min_cols = std::max(1, ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_MIN_COLS", 1));
+-    static const int max_cols = std::min(XMX_Q80_MAX_COLS, ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_MAX_COLS", 8));
++    static const int max_cols = std::min(XMX_Q80_WIDE_COLS,
++                                         ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_MAX_COLS", ggml_sycl_xmx_wide() ? 16 : 8));
+     if (src1->ne[1] < min_cols || src1->ne[1] > max_cols) {
+         return false;
+     }
+@@ -63,7 +81,7 @@ bool ggml_sycl_xmx_q80_can_use(ggml_backend_sycl_context & ctx, const ggml_tenso
+         return false;
+     }
+     static const size_t min_bytes = (size_t) std::max(0, ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_MIN_MB", 64)) << 20;
+-    if (ggml_nbytes(src0) < min_bytes) {
++    if (src1->ne[1] <= 8 && ggml_nbytes(src0) < min_bytes) {   // above 8 columns MMVQ is out of reach
+         return false;
+     }
+     if (g_ggml_sycl_prioritize_dmmv || src0->extra == nullptr || src0->buffer == nullptr) {
+@@ -221,6 +239,126 @@ sycl::event xmx_q80_launch(const int8_t * dQs, const uint16_t * dDd, const int8_
+     });
+ }
+ 
++// LOCAL (longdraft): the kernel above as a template on the column count, instantiated only for MC = 16 (two A tiles,
++// columns 0..7 and 8..15, on every staged B tile; xa [16][K], d8 [16][G]); per column the float operations and their
++// order are the one-tile kernel's. 1..8 columns keep the unmodified kernel above.
++template <int MC>
++sycl::event xmx_q80_launch_wide(const int8_t * dQs, const uint16_t * dDd, const int8_t * dXa, const sycl::half * dD8,
++                                float * dOut, int N, int K, int M, int64_t ldd, int ks, sycl::queue & q) {
++    static_assert(MC == 16, "two A tiles");
++    constexpr int NT = MC / X8_TM;
++    const int KB = K / XMX_Q80_SB, G = K / QK8_0;
++    return q.submit([&](sycl::handler & h) {
++        sycl::local_accessor<int8_t, 1> bslm(sycl::range<1>(ks * 16 * X8_PB), h);
++        sycl::local_accessor<float, 1>  red(sycl::range<1>(ks > 1 ? ks * MC * 16 : 1), h);
++        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N / 16) * ks * X8_SG), sycl::range<1>(ks * X8_SG)),
++                       sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> },
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(X8_SG)]] {
++            using sycl::access::address_space;
++            using sycl::access::decorated;
++            sycl::sub_group sg = it.get_sub_group();
++            const int lane = sg.get_local_id()[0];
++            const int s    = sg.get_group_id()[0];
++            const int row0 = (int) it.get_group(0) * 16;
++            const int b0   = s * KB / ks, b1 = (s + 1) * KB / ks;
++            auto bp = bslm.get_multi_ptr<decorated::no>() + s * 16 * X8_PB;
++
++            const int pp = lane % 8, rr = lane / 8;
++            const int8_t * gb = dQs + (size_t) (row0 + rr) * K + pp * 16;
++            const int so = rr * X8_PB + pp * 16;
++            const sycl::uint4 * hdw = reinterpret_cast<const sycl::uint4 *>(dDd + (size_t) (row0 + lane) * G);   // 8 halves / super-block
++            const sycl::uint4 * d8b = reinterpret_cast<const sycl::uint4 *>(dD8 + (size_t) lane * G);            // column lane
++
++            auto ldq = [](const int8_t * p) -> sycl::uint4 { return *reinterpret_cast<const sycl::uint4 *>(p); };
++            sycl::uint4 v[8];
++#pragma unroll
++            for (int j = 0; j < 8; ++j) { v[j] = ldq(gb + (size_t) 2 * j * K + (size_t) b0 * XMX_Q80_SB); }
++            sycl::uint4 hw = hdw[b0], hc = d8b[b0];
++
++            float F[MC];
++#pragma unroll
++            for (int i = 0; i < MC; ++i) { F[i] = 0.f; }
++            for (int b = b0; b < b1; ++b) {
++                float dw[8], dc[8];   // this lane's row scales and column `lane`'s d8 for the 8 groups
++                {
++                    const uint32_t a[4] = { hw.x(), hw.y(), hw.z(), hw.w() };
++                    const uint32_t c[4] = { hc.x(), hc.y(), hc.z(), hc.w() };
++#pragma unroll
++                    for (int j = 0; j < 4; ++j) {
++                        dw[2 * j]     = (float) sycl::bit_cast<sycl::half>((uint16_t) (a[j] & 0xFFFF));
++                        dw[2 * j + 1] = (float) sycl::bit_cast<sycl::half>((uint16_t) (a[j] >> 16));
++                        dc[2 * j]     = (float) sycl::bit_cast<sycl::half>((uint16_t) (c[j] & 0xFFFF));
++                        dc[2 * j + 1] = (float) sycl::bit_cast<sycl::half>((uint16_t) (c[j] >> 16));
++                    }
++                    const int bn = b + 1 < b1 ? b + 1 : b;   // next header (clamped, unconditional)
++                    hw = hdw[bn];
++                    hc = d8b[bn];
++                }
++#pragma unroll
++                for (int part = 0; part < 2; ++part) {
++#pragma unroll
++                    for (int j = 0; j < 8; ++j) {
++                        *reinterpret_cast<sycl::uint4 *>(&bp[so + 2 * j * X8_PB]) = v[j];
++                    }
++                    {   // prefetch the next part (clamped, unconditional)
++                        const int nb = part == 0 ? b : (b + 1 < b1 ? b + 1 : b);
++                        const int np = part == 0 ? 1 : (b + 1 < b1 ? 0 : 1);
++#pragma unroll
++                        for (int j = 0; j < 8; ++j) {
++                            v[j] = ldq(gb + (size_t) 2 * j * K + (size_t) nb * XMX_Q80_SB + np * X8_PB);
++                        }
++                    }
++                    sycl::group_barrier(sg);
++#pragma unroll
++                    for (int gg = 0; gg < 4; ++gg) {
++                        const int g = part * 4 + gg;
++                        mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, X8_TK, X8_TN, mx::layout::col_major> B;
++                        mx::joint_matrix_load(sg, B, bp + gg * X8_TK, X8_PB);
++#pragma unroll
++                        for (int t = 0; t < NT; ++t) {
++                            mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, X8_TM, X8_TK, mx::layout::row_major> A;
++                            mx::joint_matrix_load(sg, A,
++                                sycl::address_space_cast<address_space::global_space, decorated::no>(
++                                    dXa + (size_t) t * X8_TM * K + (size_t) b * XMX_Q80_SB + g * X8_TK), K);
++                            mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, X8_TM, X8_TN> C;
++                            mx::joint_matrix_fill(sg, C, 0);
++                            mx::joint_matrix_mad(sg, C, A, B, C);
++                            float sb[8];
++#pragma unroll
++                            for (int i = 0; i < 8; ++i) { sb[i] = dw[g] * sycl::select_from_group(sg, dc[g], t * 8 + i); }
++                            int i = 0;
++                            imx::joint_matrix_apply(sg, C, [&](int32_t & dot, size_t, size_t) {
++                                if (i < 8) { F[t * 8 + i] = sycl::fma((float) dot, sb[i], F[t * 8 + i]); }
++                                ++i;
++                            });
++                        }
++                    }
++                    sycl::group_barrier(sg);
++                }
++            }
++            if (ks > 1) {
++#pragma unroll
++                for (int i = 0; i < MC; ++i) { red[(s * MC + i) * 16 + lane] = F[i]; }
++                sycl::group_barrier(it.get_group());
++                if (s == 0) {
++#pragma unroll
++                    for (int i = 0; i < MC; ++i) {
++                        float acc = red[i * 16 + lane];
++                        for (int t = 1; t < ks; ++t) { acc += red[(t * MC + i) * 16 + lane]; }
++                        F[i] = acc;
++                    }
++                }
++            }
++            if (s == 0) {
++#pragma unroll
++                for (int i = 0; i < MC; ++i) {
++                    if (i < M) { dOut[(size_t) i * ldd + row0 + lane] = F[i]; }
++                }
++            }
++        });
++    });
++}
++
+ int xmx_q80_pick_ks(int N, int K) {
+     // 2 super-blocks per sub-group, at most 10 sub-groups per work-group. Measured on the B70 (test-backend-ops perf,
+     // 248320 x 5120, us at 1 / 8 columns): ks 1 2498 / 2537, 2 - / 2369, 4 - / 2315, 5 2250 / 2308, 8 - / 2304,
+@@ -246,7 +384,7 @@ void ggml_sycl_mul_mat_xmx_q80(ggml_backend_sycl_context & ctx, const ggml_tenso
+     const int64_t M = src1->ne[1];
+     const int64_t G = K / QK8_1;
+     GGML_ASSERT(src1->ne[0] == K && dst->ne[0] == N && dst->ne[1] == M);
+-    GGML_ASSERT(K % XMX_Q80_SB == 0 && N % XMX_Q80_ROWS == 0 && M >= 1 && M <= XMX_Q80_MAX_COLS);
++    GGML_ASSERT(K % XMX_Q80_SB == 0 && N % XMX_Q80_ROWS == 0 && M >= 1 && M <= XMX_Q80_WIDE_COLS);
+     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+     GGML_ASSERT(extra && extra->optimized_feature.reorder);
+ 
+@@ -257,6 +395,22 @@ void ggml_sycl_mul_mat_xmx_q80(ggml_backend_sycl_context & ctx, const ggml_tenso
+     const int8_t *   qs = reinterpret_cast<const int8_t *>(base);
+     const uint16_t * dd = reinterpret_cast<const uint16_t *>(base + d_off.first);
+ 
++    if (M > XMX_Q80_MAX_COLS) {
++        // LOCAL (longdraft): 9..16 columns on the two-tile kernel
++        const size_t xa16 = (size_t) XMX_Q80_WIDE_COLS * K;
++        const size_t d816 = (size_t) XMX_Q80_WIDE_COLS * G * sizeof(sycl::half);
++        ggml_sycl_pool_alloc<char> act16(ctx.pool(), xa16 + d816);
++        int8_t *     xa = reinterpret_cast<int8_t *>(act16.get());
++        sycl::half * d8 = reinterpret_cast<sycl::half *>(act16.get() + xa16);
++        sycl::queue & q = *ctx.stream();
++        xmx_q80_quant_act(static_cast<const float *>(src1->data), xa, d8, (int) K, (int) M, q);
++        static const int ks16 = ggml_sycl_xmx_q80_env_int("GGML_SYCL_XMX_Q80_KS16", 0);
++        const int ks = ks16 > 0 ? std::max(1, std::min(ks16, std::min(16, (int) (K / XMX_Q80_SB)))) : xmx_q80_pick_ks((int) N, (int) K);
++        xmx_q80_launch_wide<XMX_Q80_WIDE_COLS>(qs, dd, xa, d8, static_cast<float *>(dst->data), (int) N, (int) K, (int) M,
++                                               dst->ne[0], ks, q);
++        return;
++    }
++
+     const size_t xa_bytes = (size_t) XMX_Q80_MAX_COLS * K;
+     const size_t d8_bytes = (size_t) XMX_Q80_MAX_COLS * G * sizeof(sycl::half);
+     ggml_sycl_pool_alloc<char> act_alloc(ctx.pool(), xa_bytes + d8_bytes);
+@@ -309,7 +463,7 @@ void ggml_sycl_mul_mat_xmx_q80(ggml_backend_sycl_context & ctx, const ggml_tenso
+     }
+ } catch (const sycl::exception & exc) {
+     std::cerr << exc.what() << "Exception caught at file:" << __FILE__ << ", line:" << __LINE__ << std::endl;
+-    std::exit(1);
++    GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ #else  // !GGML_SYCL_XMX
+diff --git a/ggml/src/ggml-sycl/mmq-xmx-q80.hpp b/ggml/src/ggml-sycl/mmq-xmx-q80.hpp
+index b127bfb722..734d0d5058 100644
+--- a/ggml/src/ggml-sycl/mmq-xmx-q80.hpp
++++ b/ggml/src/ggml-sycl/mmq-xmx-q80.hpp
+@@ -17,6 +17,14 @@
+ 
+ #include "common.hpp"
+ 
++// GGML_SYCL_XMX_WIDE=1 (LOCAL longdraft, default off), read once: the XMX q6_K / q8_0 matmuls and the XMX flash
++// attention serve 9..16 columns (verify batches of up to 16 tokens); their 1..8-column kernels are unchanged
++bool ggml_sycl_xmx_wide();
++
++// LOCAL (wideverify): GGML_SYCL_XMX_WIDE=1 and GGML_SYCL_XMX_DIRECT_WIDE != 0 (default 1): the register-fed q4_K / q6_K
++// kernels (their DIRECT switches) also serve 9..16 columns
++bool ggml_sycl_xmx_direct_wide();
++
+ // true when src0 x src1 -> dst is a q8_0 mul_mat this path can serve on ctx.device (type, shape, column window,
+ // size, env, device); no side effects. The caller must still make sure src0 is in the reorder layout.
+ bool ggml_sycl_xmx_q80_can_use(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+diff --git a/ggml/src/ggml-sycl/mmq.cpp b/ggml/src/ggml-sycl/mmq.cpp
+index ffb272aa28..8df0914a59 100644
+--- a/ggml/src/ggml-sycl/mmq.cpp
++++ b/ggml/src/ggml-sycl/mmq.cpp
+@@ -1882,7 +1882,7 @@ static void ggml_mul_mat_q4_0_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *vx, const void *vy,
+@@ -1997,7 +1997,7 @@ static void ggml_mul_mat_q4_1_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *vx, const void *vy,
+@@ -2112,7 +2112,7 @@ static void ggml_mul_mat_q5_0_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *vx, const void *vy,
+@@ -2227,7 +2227,7 @@ static void ggml_mul_mat_q5_1_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *vx, const void *vy,
+@@ -2342,7 +2342,7 @@ static void ggml_mul_mat_q8_0_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *vx, const void *vy,
+@@ -2463,7 +2463,7 @@ static void ggml_mul_mat_q2_K_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *vx, const void *vy,
+@@ -2593,7 +2593,7 @@ static void ggml_mul_mat_q3_K_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
+@@ -2714,7 +2714,7 @@ static void ggml_mul_mat_q4_K_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *vx, const void *vy,
+@@ -2835,7 +2835,7 @@ static void ggml_mul_mat_q5_K_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *vx, const void *vy,
+@@ -2956,7 +2956,7 @@ static void ggml_mul_mat_q6_K_q8_1_sycl(const void *vx, const void *vy,
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+ 
+ void ggml_sycl_op_mul_mat_q(
+@@ -3026,5 +3026,5 @@ void ggml_sycl_op_mul_mat_q(
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+-  std::exit(1);
++  GGML_SYCL_EXIT_OR_RETHROW();
+ }
+diff --git a/ggml/src/ggml-sycl/mmvq.cpp b/ggml/src/ggml-sycl/mmvq.cpp
+index c36dcfe037..89217e91a6 100644
+--- a/ggml/src/ggml-sycl/mmvq.cpp
++++ b/ggml/src/ggml-sycl/mmvq.cpp
+@@ -3375,12 +3375,21 @@ static int ggml_sycl_smallrow_forced_ks() {
+     return v;
+ }
+ 
++// LOCAL (longdraft): the GDN alpha/beta fusion (the only caller of shape_ok) also takes 9..16 columns with
++// GGML_SYCL_XMX_WIDE=1 (or GGML_SYCL_SMALLROW_FUSE_MAX_COLS=9..16); without it those verify sizes ran the matmuls on
++// XMX (16 rows per sub-group: 3 tiles for 48 rows) plus the four epilogue ops unfused
++static int ggml_sycl_smallrow_fuse_max_cols() {
++    static const int v = std::max(1, std::min(16, ggml_sycl_smallrow_env("GGML_SYCL_SMALLROW_FUSE_MAX_COLS",
++                                                                          ggml_sycl_smallrow_env("GGML_SYCL_XMX_WIDE", 0) != 0 ? 16 : 8)));
++    return v;
++}
++
+ bool ggml_sycl_smallrow_shape_ok(ggml_type type, int64_t nrows, int64_t ncols, int64_t ncols_dst) {
+     if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q6_K) {
+         return false;
+     }
+     return nrows >= 1 && nrows <= ggml_sycl_smallrow_max_rows(type) && ncols % QK_K == 0 && ncols_dst >= 1 &&
+-           ncols_dst <= 8;
++           ncols_dst <= ggml_sycl_smallrow_fuse_max_cols();
+ }
+ 
+ bool ggml_sycl_smallrow_can_use(ggml_type type, int64_t nrows, int64_t ncols_dst) {
+@@ -3543,6 +3552,16 @@ static bool mul_mat_vec_q_reorder_splitk_switch(const ggml_sycl_splitk_job & j0,
+         case 6: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 6>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+         case 7: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 7>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+         case 8: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 8>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
++        // LOCAL (longdraft): 9..16 columns (GDN alpha/beta fusion at long verify batches; WARP_SIZE lanes hold the
++        // per-column results, so 16 is the limit)
++        case 9:  launch_mul_mat_vec_q_reorder_splitk<vec_dot, 9>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
++        case 10: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 10>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
++        case 11: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 11>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
++        case 12: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 12>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
++        case 13: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 13>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
++        case 14: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 14>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
++        case 15: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 15>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
++        case 16: launch_mul_mat_vec_q_reorder_splitk<vec_dot, 16>(j0, j1, nmat, vy, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); return true;
+         default: return false;
+     }
+ }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 46b35fdd69..ca53f0c7c3 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10243,6 +10243,40 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4100, nc, 5120, { 1, 1 }, { 1, 1 }));
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096, nc, 5152, { 1, 1 }, { 1, 1 }));
+     }
++    // LOCAL (longdraft): the SYCL XMX q6_K / q8_0 two-tile kernels at 9..16 columns (GGML_SYCL_XMX_WIDE=1; q8_0 small
++    // shapes need GGML_SYCL_XMX_Q80_MIN_MB=0): house shapes, the small-row weights (no split-K MMVQ above 8 columns),
++    // a single 256-block K and K = 11*256
++    for (int nc : { 9, 10, 11, 12, 13, 15, 16 }) {
++        for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {5120, 17408}, {10240, 5120}, {1024, 5120}, {48, 5120}, {32, 256}, {64, 2816} }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++        }
++        for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {4096, 5120}, {1024, 256}, {64, 2816}, {48, 5120} }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++        }
++    }
++    for (int nc : { 12, 16 }) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, nc, 5120, { 1, 1 }, { 1, 1 }));
++    }
++    // LOCAL (wideverify): the SYCL register-fed q4_K kernel at 9..16 columns (GGML_SYCL_XMX_Q4K_DIRECT=1 +
++    // GGML_SYCL_XMX_WIDE=1): every house q4_K shape (incl. the MTP eh_proj and the 98304-row draft head), a single
++    // 256-block K, K = 11*256, and the small-row weights that take XMX above 8 columns
++    for (int nc : { 9, 10, 11, 13, 14, 15, 16 }) {
++        for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {6144, 5120}, {5120, 6144},
++                                                               {12288, 5120}, {1024, 5120}, {5120, 10240}, {48, 5120},
++                                                               {32, 256}, {64, 2816} }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++        }
++    }
++    for (int nc : { 9, 16 }) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 98304, nc, 5120, { 1, 1 }, { 1, 1 }));
++    }
++    // LOCAL (wideverify): 9..16-column mul_mats that fall to dequantize + oneDNN GEMM on SYCL (no XMX / MMVQ path):
++    // with GGML_SYCL_ENABLE_GRAPH=1 + GGML_SYCL_GRAPH_RECORD_AHEAD=1 (or GGML_SYCL_GRAPH_SELFTEST=1) and
++    // GGML_SYCL_GRAPH_MAX_TOKENS >= 12 their graph is recorded; the recording must fail over to eager, not exit
++    for (int nc : { 9, 12 }) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 4096, nc, 5120, { 1, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, nc, 5120, { 1, 1 }, { 1, 1 }));
++    }
+     // LOCAL (not for upstream): SYCL XMX q4_K / q6_K edge shapes. K = 11*256 pads the q8_1 row to 3072 with the ds
+     // values at the unpadded K; 4100 rows is not a multiple of the 16-row tile, so XMX must decline and MMVQ serve it.
+     for (ggml_type type_a : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+@@ -10263,7 +10297,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     // LOCAL (not for upstream): qwen35 gated-delta layer chains (SYCL GDN fusions)
+     for (ggml_type type_w : { GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+-        for (int nc : { 1, 2, 3, 6, 8 }) {
++        for (int nc : { 1, 2, 3, 6, 8, 9, 12, 16 }) {   // LOCAL (longdraft): 9..16 (GGML_SYCL_XMX_WIDE)
+             test_cases.emplace_back(new test_gdn_chain(type_w, 5120, nc, 1));
+         }
+         // (no multi-layer eval case: the residual chain amplifies the q8_1-vs-CPU activation quantization gap past
+@@ -11151,6 +11185,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (int nb : { 1, 4, 8, }) {
+         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+     }
++    // LOCAL (wideverify): the q8_0 XMX kernel with the wide query-row splits (GGML_SYCL_XMX_WIDE=1): the MTP catch-up
++    // over a q8_0 draft KV cache at 9..16 tokens, a partial last chunk + KV view, a deep cache, a 1-chunk cache
++    for (int nb : { 10, 11, 13, 14, 15, }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++    }
++    for (int nb : { 9, 12, 16, }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4160, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++    }
++    // LOCAL (longdraft): SYCL XMX FA above 48 query rows per KV head (GGML_SYCL_XMX_WIDE=1: 9..16 tokens x GQA 6 as
++    // query-row splits), a partial last chunk + KV view, and GQA 8 / 16 row counts that need 2 / 3 splits
++    for (int nb : { 9, 10, 11, 12, 13, 14, 15, 16 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4160, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true));
++    }
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1},  4096, 9,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 4096, 9,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 32768, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+ 
+     // prefill-shaped cases with long KV (nb >= 32, kv >= 1024): covers the
+     // XMX/GEMM-accelerated SYCL FA path which only activates for these shapes.
+@@ -11525,6 +11578,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // LOCAL (longdraft): one verify step of the house model (Qwen3.8-27B qwen35 Q4_K_M, q8_0 LM head) at 8..16 tokens,
++    // every op shape it runs; env LONGDRAFT_ONLY=1 keeps just these (the rest of the perf list is skipped)
++    {
++        for (int nc : { 8, 9, 10, 12, 14, 16 }) {
++            for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120},
++                                                                   {12288, 5120}, {5120, 6144}, {1024, 5120}, {48, 5120} }) {
++                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++            }
++            for (auto [nw, kw] : std::vector<std::pair<int,int>>{ {10240, 5120}, {5120, 17408}, {1024, 5120} }) {
++                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, nw, nc, kw, { 1, 1 }, { 1, 1 }));
++            }
++            // LM head: 1/10 of it (24832 rows) always - the unextended path dequantizes the whole weight to f16 (2.5 GB
++            // for the full head); the full 248320 rows as a separate case (run it only where the XMX path serves it)
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 24832, nc, 5120, { 1, 1 }, { 1, 1 }));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248320, nc, 5120, { 1, 1 }, { 1, 1 }));
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 51200, nc, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
++            // LOCAL (wideverify): the MTP catch-up attention over a q8_0 draft KV cache, and the MTP eh_proj
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 51200, nc, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 5120, nc, 10240, { 1, 1 }, { 1, 1 }));
++            test_cases.emplace_back(new test_gdn_gather(48, 128, nc, nc - 1, 1, 3));
++            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, nc, 1, 3, false, false, nc - 1));
++            test_cases.emplace_back(new test_gdn_chain(GGML_TYPE_Q4_K, 5120, nc, 1));
++            test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {5120, nc, 1, 1}, 1e-6f));
++            test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {5120, nc, 1, 1}, {1, 1, 1, 1}));
++            test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {3 + nc, 10240, 1, 1}, {4, 10240, 1, 1}, false));
++            test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SWIGLU, GGML_TYPE_F32, {17408, nc, 1, 1}, 0));
++            test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, {128, 16, nc, 1}, 1e-6f, false));
++        }
++    }
++    if (getenv("LONGDRAFT_ONLY")) {
++        return test_cases;
++    }
++
+     // [step-prof] house model: q8_0 LM head (248320), q8_0 MTP draft head (98304), q8_0 MTP layer shapes,
+     // GDN (16 k-heads x3 v-repeat, d128, K rollback slots), ssm_conv, rms_norm, top-k over the padded vocab
+     for (int nc : { 1, 2, 3, 4, 5, 6, 7, 8 }) {

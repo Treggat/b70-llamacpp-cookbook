@@ -1,0 +1,465 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Mon, 28 Sep 2026 12:56:44 -0600
+Subject: [PATCH 24/27] sycl : deterministic oneDNN matmuls
+ (GGML_SYCL_DNN_DETERMINISTIC)
+
+For f16 GEMMs with a small M x N and a large K, oneDNN's jit:gemm picks
+a split-K kernel that adds its partial sums with float atomics, so the
+result changes from run to run (up to 2.3e-5 per value; seen on the
+48-row ssm_alpha/beta and 1024-row attn_k/v matmuls at batches of about
+80..1500 tokens). GGML_SYCL_DNN_DETERMINISTIC=1 (default off) sets
+primitive_attr::set_deterministic(true) on the oneDNN matmul
+primitives. Shapes that did not use the atomic kernels are unchanged.
+Diagnostics: GGML_SYCL_DNN_LOG, GGML_SYCL_NODE_HASH(_FILE); in
+test-backend-ops TBO_REPEAT (repeat and compare bit for bit), TBO_SEED.
+
+Assisted-by: Claude Opus 5.5
+---
+ ggml/src/ggml-sycl/gemm.hpp       |  43 ++++++++
+ ggml/src/ggml-sycl/ggml-sycl.cpp  | 158 ++++++++++++++++++++++++++++++
+ ggml/src/ggml-sycl/mmq-dnn-u4.cpp |   2 +
+ tests/test-backend-ops.cpp        | 106 +++++++++++++++++++-
+ 4 files changed, 307 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-sycl/gemm.hpp b/ggml/src/ggml-sycl/gemm.hpp
+index 81bc5c2e6b..3ab6cc172d 100644
+--- a/ggml/src/ggml-sycl/gemm.hpp
++++ b/ggml/src/ggml-sycl/gemm.hpp
+@@ -20,6 +20,12 @@
+ #include "dnnl.hpp"
+ #include "dnnl_sycl.hpp"
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <set>
++#include <tuple>
++
+ class DnnlGemmWrapper {
+ public:
+     using dt = dnnl::memory::data_type;
+@@ -35,6 +41,36 @@ public:
+         else static_assert(0);
+     }
+ 
++    // LOCAL: GGML_SYCL_DNN_DETERMINISTIC (default 0)
++    static bool dnn_deterministic() {
++        static const bool v = [] {
++            const char * e = getenv("GGML_SYCL_DNN_DETERMINISTIC");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        return v;
++    }
++
++    // LOCAL: GGML_SYCL_DNN_LOG=1 prints the oneDNN implementation chosen for every new gemm shape (stderr, once)
++    static void dnn_log_impl(int m, int n, int k, int at, int bt, int ct, dnnl_dim_t ba, dnnl_dim_t bb,
++                             const dnnl::matmul::primitive_desc & pd) {
++        static const bool on = [] {
++            const char * e = getenv("GGML_SYCL_DNN_LOG");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        if (!on) {
++            return;
++        }
++        static std::mutex mtx;
++        static std::set<std::tuple<int, int, int, int, int, int, long, long>> seen;
++        std::lock_guard<std::mutex> lock(mtx);
++        if (!seen.insert({ m, n, k, at, bt, ct, (long) ba, (long) bb }).second) {
++            return;
++        }
++        fprintf(stderr, "[SYCL-DNN] gemm m=%d n=%d k=%d dt=%d/%d/%d batch=%ld/%ld det=%d scratch=%zu impl=%s\n", m, n,
++                k, at, bt, ct, (long) ba, (long) bb, (int) dnn_deterministic(), pd.scratchpad_desc().get_size(),
++                pd.impl_info_str());
++    }
++
+     static void gemm(ggml_backend_sycl_context & ctx, int m, int n, int k,
+         const void * a, dt at, dnnl_dim_t stra0, dnnl_dim_t stra1, dnnl_dim_t stra2,
+         const void * b, dt bt, dnnl_dim_t strb0, dnnl_dim_t strb1, dnnl_dim_t strb2,
+@@ -60,11 +96,18 @@ public:
+ #ifdef GGML_SYCL_F16
+         primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
+ #endif
++        // LOCAL: GGML_SYCL_DNN_DETERMINISTIC=1 asks oneDNN for run-to-run reproducible kernels. Without it the
++        // gemm picks, for some shapes (e.g. N = 176 / 1222 tokens), a k-parallel kernel that reduces its partial
++        // sums with global float atomics, so identical inputs give different bits from run to run.
++        if (dnn_deterministic()) {
++            primitive_attr.set_deterministic(true);
++        }
+ 
+         auto a_mem = dnnl::memory(a_in_md, eng, const_cast<void*>(a));
+         auto b_mem = dnnl::memory(b_in_md, eng, const_cast<void*>(b));
+         auto matmul_pd = dnnl::matmul::primitive_desc(eng, a_in_md, b_in_md, c_md, primitive_attr);
+         auto c_mem = dnnl::memory(matmul_pd.dst_desc(), eng, c);
++        dnn_log_impl(m, n, k, (int) at, (int) bt, (int) ct, batches_a, batches_b, matmul_pd);
+ 
+         const auto scratchpad_md = matmul_pd.scratchpad_desc();
+         ggml_sycl_pool_alloc<uint8_t> scratchpad(ctx.pool());
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index d05805334c..692e46c40f 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -40,6 +40,7 @@
+ #include <cstring>
+ #include <string>
+ #include <cstdio>
++#include <unistd.h>
+ #include <sycl/sycl.hpp>
+ #include <sycl/backend.hpp>
+ #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+@@ -6747,6 +6748,141 @@ static int ggml_sycl_gdn_gather_target(const ggml_cgraph * cgraph, int node_idx)
+     return -1;
+ }
+ 
++// ---- LOCAL: GGML_SYCL_NODE_HASH=N (default 0 = off): determinism probe. For every graph whose widest MUL_MAT has
++//      N columns (tokens; -1 = every graph), wait after each node group and log a 64-bit hash of the output bytes of
++//      every node (and of the inputs of the group's first node) to GGML_SYCL_NODE_HASH_FILE.<pid> (default stderr).
++//      The hash is computed on the device (fixed 4 KiB chunks, fixed order), so it is itself deterministic. Nodes
++//      that a fusion folded into a later node are marked "fused" (their buffers may not be written), and GET_ROWS
++//      nodes that GGML_SYCL_GDN_GATHER folds into the GATED_DELTA_NET node get an "NF" line (never written). Graph recording cannot wait, so a
++//      recorded graph is not hashed: run with GGML_SYCL_ENABLE_GRAPH=0 for the hashed batch size.
++static int ggml_sycl_node_hash_ntok() {
++    static const int v = ggml_sycl_get_env("GGML_SYCL_NODE_HASH", 0);
++    return v;
++}
++
++struct ggml_sycl_node_hasher {
++    FILE *     f        = nullptr;
++    uint64_t * d_chunks = nullptr;
++    size_t     cap      = 0;
++    int64_t    graph_no = 0;
++    std::vector<uint64_t> h_chunks;
++
++    FILE * out() {
++        if (f == nullptr) {
++            const char * p = getenv("GGML_SYCL_NODE_HASH_FILE");
++            if (p != nullptr && *p) {
++                char name[1024];
++                snprintf(name, sizeof(name), "%s.%d", p, (int) getpid());
++                f = fopen(name, "a");
++            }
++            if (f == nullptr) {
++                f = stderr;
++            }
++        }
++        return f;
++    }
++
++    uint64_t hash(sycl::queue & q, const void * ptr, size_t n) {
++        if (ptr == nullptr || n == 0) {
++            return 0;
++        }
++        const size_t CH = 4096;
++        const size_t nch = (n + CH - 1) / CH;
++        if (nch > cap) {
++            if (d_chunks) {
++                sycl::free(d_chunks, q);
++            }
++            cap      = std::max(nch, (size_t) 1 << 16);
++            d_chunks = sycl::malloc_device<uint64_t>(cap, q);
++        }
++        uint64_t *      dc = d_chunks;
++        const uint8_t * b  = (const uint8_t *) ptr;
++        q.parallel_for(sycl::range<1>(nch), [=](sycl::id<1> id) {
++             const size_t c   = id[0];
++             const size_t beg = c * CH;
++             const size_t end = beg + CH < n ? beg + CH : n;
++             uint64_t     h   = 0xcbf29ce484222325ull ^ (uint64_t) c;
++             for (size_t j = beg; j < end; ++j) {
++                 h = (h ^ b[j]) * 0x100000001b3ull;
++             }
++             dc[c] = h;
++         }).wait();
++        h_chunks.resize(nch);
++        q.memcpy(h_chunks.data(), dc, nch * sizeof(uint64_t)).wait();
++        uint64_t h = 0x9e3779b97f4a7c15ull ^ n;
++        for (size_t c = 0; c < nch; ++c) {
++            h ^= h_chunks[c] + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
++        }
++        return h;
++    }
++
++    uint64_t hash_tensor(sycl::queue & q, const ggml_tensor * t) {
++        return t && t->data ? hash(q, t->data, ggml_nbytes(t)) : 0;
++    }
++};
++
++static ggml_sycl_node_hasher g_sycl_node_hasher;
++
++static bool ggml_sycl_node_hash_want(const ggml_cgraph * cgraph) {
++    const int want = ggml_sycl_node_hash_ntok();
++    if (want == 0 || g_ggml_sycl_graph_recording) {
++        return false;
++    }
++    int64_t ntok = 0;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * n = cgraph->nodes[i];
++        if (n->op == GGML_OP_MUL_MAT && n->src[1]) {
++            ntok = std::max(ntok, n->src[1]->ne[1]);
++        }
++    }
++    return want < 0 || ntok == want;
++}
++
++// hash the outputs of nodes [from, to) (to = the next group's first node); skipped = fused-away intermediates
++static void ggml_sycl_node_hash_group(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, int from, int to) {
++    sycl::queue & q = *ctx->stream();
++    q.wait();
++    FILE * f = g_sycl_node_hasher.out();
++    int last = -1;
++    for (int j = from; j < to && j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (!ggml_sycl_is_view_or_noop(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
++            last = j;
++        }
++    }
++    for (int j = from; j < to && j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            continue;
++        }
++        char ins[512];
++        int  off = 0;
++        ins[0]   = 0;
++        if (j == from) {
++            for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
++                off += snprintf(ins + off, sizeof(ins) - off, "%s%016" PRIx64, s ? "," : "",
++                                g_sycl_node_hasher.hash_tensor(q, n->src[s]));
++            }
++        }
++        fprintf(f, "NH g=%" PRId64 " i=%d op=%s t=%s ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " %s out=%016" PRIx64 " in=%s name=%s\n",
++                g_sycl_node_hasher.graph_no, j, ggml_op_desc(n), ggml_type_name(n->type), n->ne[0], n->ne[1],
++                n->ne[2], n->ne[3], j == last ? "last" : "fused", g_sycl_node_hasher.hash_tensor(q, n), ins, n->name);
++    }
++}
++
++// inputs of the group's first node must be hashed BEFORE it runs (in-place ops overwrite them)
++static void ggml_sycl_node_hash_inputs(ggml_backend_sycl_context * ctx, const ggml_cgraph * cgraph, int i) {
++    sycl::queue & q = *ctx->stream();
++    q.wait();
++    const ggml_tensor * n = cgraph->nodes[i];
++    FILE * f = g_sycl_node_hasher.out();
++    fprintf(f, "NI g=%" PRId64 " i=%d", g_sycl_node_hasher.graph_no, i);
++    for (int s = 0; s < GGML_MAX_SRC && n->src[s]; ++s) {
++        fprintf(f, " %016" PRIx64, g_sycl_node_hasher.hash_tensor(q, n->src[s]));
++    }
++    fprintf(f, " name=%s\n", n->name);
++}
++
+ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+     ggml_sycl_set_main_device(sycl_ctx->device);
+     ggml_sycl_op_prof_graph_begin(cgraph);
+@@ -6757,6 +6893,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+     int                 gdn_gather_at[64];
+     int                 n_gdn_gather = 0;
+ 
++    const bool nh      = ggml_sycl_node_hash_want(cgraph);
++    int        nh_from = 0;   // first node of the group that has not been hashed yet
++    if (nh) {
++        g_sycl_node_hasher.graph_no++;
++        fprintf(g_sycl_node_hasher.out(), "NG g=%" PRId64 " n_nodes=%d\n", g_sycl_node_hasher.graph_no, cgraph->n_nodes);
++    }
++
+     for (int i = 0; i < cgraph->n_nodes; i++) {
+         ggml_tensor * node = cgraph->nodes[i];
+         if (ggml_sycl_is_view_or_noop(node)) {
+@@ -6765,6 +6908,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+             continue;
+         }
++        if (nh) {
++            if (i > nh_from) {
++                ggml_sycl_node_hash_group(sycl_ctx, cgraph, nh_from, i);
++            }
++            nh_from = i;
++            ggml_sycl_node_hash_inputs(sycl_ctx, cgraph, i);
++        }
+ 
+         if (node->op == GGML_OP_GET_ROWS && g_ggml_sycl_enable_fusion && ggml_sycl_gdn_gather_enabled() &&
+             n_gdn_gather < 64) {
+@@ -6773,6 +6923,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+                 gdn_gather_gr[n_gdn_gather] = node;
+                 gdn_gather_at[n_gdn_gather] = at;
+                 ++n_gdn_gather;
++                if (nh) {
++                    fprintf(g_sycl_node_hasher.out(), "NF g=%" PRId64 " i=%d gather folded into node %d\n",
++                            g_sycl_node_hasher.graph_no, i, at);
++                }
+                 static bool noted = false;
+                 if (!noted) {
+                     noted = true;
+@@ -6901,6 +7055,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
+         }
+         GGML_ASSERT(ok);
+     }
++    if (nh) {
++        ggml_sycl_node_hash_group(sycl_ctx, cgraph, nh_from, cgraph->n_nodes);
++        fflush(g_sycl_node_hasher.out());
++    }
+     ggml_sycl_op_prof_graph_end();
+ }
+ 
+diff --git a/ggml/src/ggml-sycl/mmq-dnn-u4.cpp b/ggml/src/ggml-sycl/mmq-dnn-u4.cpp
+index c1c63f7060..dffa4e1bc6 100644
+--- a/ggml/src/ggml-sycl/mmq-dnn-u4.cpp
++++ b/ggml/src/ggml-sycl/mmq-dnn-u4.cpp
+@@ -337,6 +337,7 @@ dnn_u4_prims & dnn_u4_get_prims(ggml_backend_sycl_context & ctx, const queue_ptr
+     attr.set_fpmath_mode(fpmath_mode::f16, true);
+     attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { 32, 1 }, memory::data_type::f16);
+     attr.set_scratchpad_mode(scratchpad_mode::user);
++    if (getenv("GGML_SYCL_DNN_DETERMINISTIC") && atoi(getenv("GGML_SYCL_DNN_DETERMINISTIC")) != 0) { attr.set_deterministic(true); }   // LOCAL: see gemm.hpp
+     // f16 output by default: the f32-output primitive selects a slower kernel on this device (GGML_SYCL_DNN_U4_F32DST=1 to try it)
+     static const bool want_f32 = getenv("GGML_SYCL_DNN_U4_F32DST") && atoi(getenv("GGML_SYCL_DNN_U4_F32DST")) != 0;
+     matmul::primitive_desc pd;
+@@ -371,6 +372,7 @@ dnn_u4_prims & dnn_u4_get_prims(ggml_backend_sycl_context & ctx, const queue_ptr
+         po.append_sum(1.0f);
+         cattr.set_post_ops(po);
+         cattr.set_scratchpad_mode(scratchpad_mode::user);
++        if (getenv("GGML_SYCL_DNN_DETERMINISTIC") && atoi(getenv("GGML_SYCL_DNN_DETERMINISTIC")) != 0) { cattr.set_deterministic(true); }
+         matmul::primitive_desc cpd(eng, a_md, b_md, c_md, cattr);
+         p.corr         = matmul(cpd);
+         p.corr_scratch = cpd.scratchpad_desc().get_size();
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7ca29a4fdc..27f0fd4e6d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -58,7 +58,18 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
+         // parallel initialization
+         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
+ 
++        // LOCAL (determinism): TBO_SEED=S makes the data reproducible across processes (per-chunk engine seeded from
++        // S, the tensor size and the chunk start), so outputs of two builds / env settings can be compared bit for bit
++        static const char * seed_env = getenv("TBO_SEED");
+         auto init_thread = [&](size_t start, size_t end) {
++            if (seed_env) {
++                std::default_random_engine gen((unsigned) (atoll(seed_env) * 1000003ull + nels * 7919ull + start));
++                std::uniform_real_distribution<float> distribution(min, max);
++                for (size_t i = start; i < end; i++) {
++                    data[i] = distribution(gen);
++                }
++                return;
++            }
+             thread_local std::default_random_engine gen(std::random_device{}());
+             std::uniform_real_distribution<float> distribution(min, max);
+             for (size_t i = start; i < end; i++) {
+@@ -1599,9 +1610,55 @@ struct test_case {
+                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                                fused_nodes_to_verify.size());
+ 
++        // LOCAL (determinism): TBO_REPEAT=N recomputes the graph N more times on backend1 with the same inputs and
++        // compares the output bytes with the first run (the result of the compare above): any difference = the op
++        // is not run-to-run reproducible. Prints one [repeat] line per case; a difference fails the case.
++        bool repeat_ok = true;
++        if (const char * rep_env = getenv("TBO_REPEAT")) {
++            const int reps = atoi(rep_env);
++            const size_t nb = ggml_nbytes(out);
++            std::vector<uint8_t> ref(nb), cur(nb);
++            ggml_backend_tensor_get(out, ref.data(), 0, nb);
++            int ndiff_runs = 0;
++            size_t ndiff_max = 0;
++            double maxabs = 0.0;
++            for (int r = 0; r < reps; ++r) {
++                ggml_backend_graph_compute(backend1, gf);
++                ggml_backend_tensor_get(out, cur.data(), 0, nb);
++                if (memcmp(ref.data(), cur.data(), nb) != 0) {
++                    ++ndiff_runs;
++                    size_t nd = 0;
++                    if (out->type == GGML_TYPE_F32) {
++                        const float * a = (const float *) ref.data();
++                        const float * b = (const float *) cur.data();
++                        for (size_t i = 0; i < nb / 4; ++i) {
++                            if (memcmp(&a[i], &b[i], 4) != 0) {
++                                ++nd;
++                                maxabs = std::max(maxabs, (double) std::fabs(a[i] - b[i]));
++                            }
++                        }
++                    } else {
++                        for (size_t i = 0; i < nb; ++i) {
++                            nd += ref[i] != cur[i];
++                        }
++                    }
++                    ndiff_max = std::max(ndiff_max, nd);
++                }
++            }
++            repeat_ok = ndiff_runs == 0;
++            uint64_t h0 = 0xcbf29ce484222325ull;
++            for (size_t i = 0; i < nb; ++i) {
++                h0 = (h0 ^ ref[i]) * 0x100000001b3ull;
++            }
++            printf("[repeat-hash] %s %s: %016llx\n", current_op_name.c_str(), vars().c_str(), (unsigned long long) h0);
++            printf("[repeat] %s %s: %d/%d runs differ from run 0, max %zu differing values of %zu, max |diff| %.3e\n",
++                   current_op_name.c_str(), vars().c_str(), ndiff_runs, reps, ndiff_max,
++                   out->type == GGML_TYPE_F32 ? nb / 4 : nb, maxabs);
++        }
++
+         // Create test result
+-        bool        test_passed = ud.ok && cmp_ok;
+-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
++        bool        test_passed = ud.ok && cmp_ok && repeat_ok;
++        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : !repeat_ok ? "not reproducible" : "test failed");
+         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
+                            error_msg);
+ 
+@@ -9338,10 +9395,52 @@ static const ggml_type other_types[] = {
+ #endif
+ 
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
++// LOCAL (determinism): the house-model matmul shapes for TBO_REPEAT (eval) and perf (env DETERM_ONLY=1)
++static std::vector<std::unique_ptr<test_case>> make_test_cases_determ() {
++    std::vector<std::unique_ptr<test_case>> test_cases;
++    // LOCAL (determinism): DETERM_ONLY=1 keeps only the house-model prefill matmul shapes (weights M x K as the model
++    // has them, DETERM_NC="176,1222" token counts, default below), for TBO_REPEAT=N run-to-run comparisons.
++    // DETERM_SHAPES="M:K:type,..." (type = q4_K / q6_K / f16 / f32) replaces the weight list.
++    std::vector<int> ncs = { 33, 62, 100, 128, 176, 256, 512, 1000, 1222, 1536, 1537, 2047, 2048 };
++    if (const char * e = getenv("DETERM_NC")) {
++        ncs.clear();
++        for (const char * q = e; *q; ) { ncs.push_back(atoi(q)); while (*q && *q != ',') { q++; } if (*q) { q++; } }
++    }
++    std::vector<std::tuple<int, int, ggml_type>> ws = {
++        {17408, 5120, GGML_TYPE_Q4_K}, {5120, 17408, GGML_TYPE_Q4_K}, {5120, 17408, GGML_TYPE_Q6_K},
++        {10240, 5120, GGML_TYPE_Q4_K}, {10240, 5120, GGML_TYPE_Q6_K}, {6144, 5120, GGML_TYPE_Q4_K},
++        {5120, 6144, GGML_TYPE_Q4_K}, {12288, 5120, GGML_TYPE_Q4_K}, {1024, 5120, GGML_TYPE_Q4_K},
++        {1024, 5120, GGML_TYPE_Q6_K}, {5120, 10240, GGML_TYPE_Q4_K}, {48, 5120, GGML_TYPE_Q4_K} };
++    if (const char * e = getenv("DETERM_SHAPES")) {
++        ws.clear();
++        for (const char * q = e; *q; ) {
++            int m = 0, k = 0; char tn[16] = {0};
++            if (sscanf(q, "%d:%d:%15[^,]", &m, &k, tn) == 3) {
++                const std::string t(tn);
++                const ggml_type ty = t == "q4_K" ? GGML_TYPE_Q4_K : t == "q6_K" ? GGML_TYPE_Q6_K :
++                                     t == "q8_0" ? GGML_TYPE_Q8_0 : t == "f16" ? GGML_TYPE_F16 :
++                                     t == "bf16" ? GGML_TYPE_BF16 : GGML_TYPE_F32;
++                ws.emplace_back(m, k, ty);
++            }
++            while (*q && *q != ',') { q++; } if (*q) { q++; }
++        }
++    }
++    for (int nc : ncs) {
++        for (auto [m, k, t] : ws) {
++            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, m, nc, k, { 1, 1 }, { 1, 1 }));
++        }
++    }
++    return test_cases;
++}
++
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+     std::default_random_engine rng(0);
+ 
++    if (getenv("DETERM_ONLY")) {
++        return make_test_cases_determ();
++    }
++
+     // unary ops
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         for (int v : {0, 1}) {
+@@ -11666,6 +11765,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ // Test cases for performance evaluation: should be representative of real-world use cases
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++    if (getenv("DETERM_ONLY")) {
++        return make_test_cases_determ();
++    }
+ 
+     // LOCAL (prefillx): every op class of one house-model prefill ubatch (Qwen3.8-27B qwen35 Q4_K_M: 48 gated-delta
+     // + 16 attention layers + the MTP layer) at 512 / 1024 / 2048 tokens and KV depth 0 / 32k / 64k / 96k. env

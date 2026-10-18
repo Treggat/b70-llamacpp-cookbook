@@ -1,0 +1,1808 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Treggat <taggert2222@gmail.com>
+Date: Mon, 28 Sep 2026 11:11:36 -0600
+Subject: [PATCH 23/27] server/llama : cheaper conversation switches (prompt
+ cache save/restore)
+
+With one slot and several clients, a request for another conversation
+first saves the slot's state to the --cache-ram prompt cache and may
+restore another one. Env switches, default off, outputs unchanged:
+- LLAMA_PCACHE_POOL: cache entries live in reused pinned host blocks
+  (counted against --cache-ram); no fresh zero-filled allocation per
+  save, restores upload at link speed
+- LLAMA_PCACHE_CKPT_MOVE: checkpoints the slot would drop are moved
+  into the cache entry instead of copied
+- LLAMA_PCACHE_KEEP: keep the host copy after a restore and save only
+  the recurrent state and changed KV rows (=2 verifies every save and
+  restore byte for byte)
+- LLAMA_SWITCH_PROF: one timestamped log line per request stage
+
+Assisted-by: Claude Opus 5.5
+---
+ common/common.cpp               |  22 ++
+ common/common.h                 |   6 +
+ include/llama.h                 |  18 ++
+ src/llama-context.cpp           | 106 +++++++-
+ src/llama-context.h             |   5 +
+ src/llama-io.h                  |   9 +
+ src/llama-kv-cache.cpp          | 197 ++++++++++++++-
+ src/llama-kv-cache.h            |  23 +-
+ src/llama-kv-cells.h            |  39 +++
+ src/llama-memory-hybrid.cpp     |   5 +
+ src/llama-memory-hybrid.h       |   2 +
+ src/llama-memory.h              |   4 +
+ tools/server/server-common.cpp  |   6 +
+ tools/server/server-context.cpp | 143 ++++++++++-
+ tools/server/server-task.cpp    | 427 +++++++++++++++++++++++++++++---
+ tools/server/server-task.h      | 102 +++++++-
+ 16 files changed, 1051 insertions(+), 63 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index d268cfd42d..874a8f8415 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2253,6 +2253,28 @@ bool common_prompt_batch_decode(
+     return true;
+ }
+ 
++// ---- [switchcost] LLAMA_SWITCH_PROF: request timeline marks (see common.h) ----
++bool common_swp_on() {
++    static const bool v = [] {
++        const char * e = getenv("LLAMA_SWITCH_PROF");
++        return e && atoi(e) != 0;
++    }();
++    return v;
++}
++
++void common_swp(const char * fmt, ...) {
++    if (!common_swp_on()) {
++        return;
++    }
++    char buf[1024];
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(buf, sizeof(buf), fmt, args);
++    va_end(args);
++    fprintf(stderr, "[swp] %12.3f | %s\n", ggml_time_us() / 1000.0, buf);
++    fflush(stderr);
++}
++
+ // ---- [prefill2] LLAMA_CKPT_POOL: reuse of checkpoint state buffers (see common.h) ----
+ static bool common_ckpt_pool_on() {
+     static const bool v = [] {
+diff --git a/common/common.h b/common/common.h
+index eea8397110..7f2d4aa1b7 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1041,6 +1041,12 @@ bool common_prompt_batch_decode(
+ // used after loading session state to ensure the sampling context has valid logits
+ bool common_replay_last_token(struct llama_context * ctx, llama_token last_token, int32_t pos);
+ 
++// [switchcost] env LLAMA_SWITCH_PROF=1 (default 0): one stderr line per request stage, "[swp] <ms since start> | msg",
++// for the timeline of a conversation switch (request -> template -> tokenize -> slot / prompt cache -> prompt eval)
++bool common_swp_on();
++void common_swp(const char * fmt, ...);
++
++
+ //
+ // Vocab utils
+ //
+diff --git a/include/llama.h b/include/llama.h
+index 7d16f690ee..ad0f5cfe78 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -944,6 +944,24 @@ extern "C" {
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+ 
++    // [switchcost] like llama_state_seq_get_data_ext, with an earlier host copy of the state of the same sequence as
++    // reference: rows that are unchanged since llama_state_seq_ref_mark() was called for seq_id (right after that copy
++    // was saved or restored) are copied from `ref` instead of the device. The result is the same bytes as without ref.
++    // A reference that does not fit is ignored. n_reused (optional) returns the number of bytes taken from ref.
++    LLAMA_API size_t llama_state_seq_get_data_ref(
++            struct llama_context * ctx,
++                         uint8_t * dst,
++                          size_t   size,
++                    llama_seq_id   seq_id,
++           llama_state_seq_flags   flags,
++                   const uint8_t * ref,
++                          size_t   ref_size,
++                          size_t * n_reused);
++
++    // [switchcost] the device state of seq_id equals a host copy that was just saved or restored: start tracking
++    // which rows change from here on
++    LLAMA_API void llama_state_seq_ref_mark(struct llama_context * ctx, llama_seq_id seq_id);
++
+     //
+     // Decoding
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b136216bc1..0f395f16df 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2944,16 +2944,70 @@ private:
+     size_t size_written = 0;
+ };
+ 
++// [switchcost] LLAMA_PCACHE_KEEP=2: every row taken from a reference state is also read from the device and compared
++static int llama_pcache_keep_mode() {
++    static const int v = [] {
++        const char * e = getenv("LLAMA_PCACHE_KEEP");
++        return e ? atoi(e) : 0;
++    }();
++    return v;
++}
++
+ class llama_io_write_host : public llama_io_write_i {
+ public:
+     llama_io_write_host(
+-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
++            uint8_t * p, size_t len, const uint8_t * ref = nullptr, size_t ref_size = 0) : ptr(p), buf_size(len), ref(ref), ref_size(ref_size) {}
+ 
+     ~llama_io_write_host() {
+         // TODO: add backend support to batch tensor_get? or some other way to speed this up
+         for (const auto & winfo : winfos) {
+             ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+         }
++
++        // [switchcost] verify mode: the reused rows must equal the device data bit for bit
++        if (!rinfos.empty()) {
++            size_t n_diff = 0;
++            size_t n_cmp  = 0;
++            std::vector<uint8_t> tmp;
++            for (const auto & r : rinfos) {
++                tmp.resize(r.size);
++                ggml_backend_tensor_get(r.tensor, tmp.data(), r.offset, r.size);
++                n_cmp += r.size;
++                if (memcmp(tmp.data(), r.ptr, r.size) != 0) {
++                    for (size_t i = 0; i < r.size; ++i) {
++                        n_diff += tmp[i] != r.ptr[i];
++                    }
++                }
++            }
++            LLAMA_LOG_WARN("[pcache] verify: %zu reused bytes compared with the device, %zu differ%s\n", n_cmp, n_diff,
++                    n_diff ? " - MISMATCH" : "");
++            if (n_diff) {
++                GGML_ABORT("[pcache] reused state rows differ from the device data");
++            }
++        }
++    }
++
++    const uint8_t * get_ref(size_t & size) const override {
++        size = ref_size;
++        return ref;
++    }
++
++    void write_ref(const uint8_t * src, ggml_tensor * tensor, size_t offset, size_t size) override {
++        if (size > buf_size) {
++            throw std::runtime_error("unexpectedly reached end of buffer");
++        }
++        memcpy(ptr, src, size);
++        if (llama_pcache_keep_mode() >= 2) {
++            rinfos.push_back({tensor, ptr, size, offset});
++        }
++        ptr += size;
++        size_written += size;
++        size_reused  += size;
++        buf_size -= size;
++    }
++
++    size_t n_reused() const {
++        return size_reused;
+     }
+ 
+     void write(const void * src, size_t size) override {
+@@ -2987,6 +3041,10 @@ private:
+     uint8_t * ptr;
+     size_t buf_size = 0;
+     size_t size_written = 0;
++    size_t size_reused  = 0;
++
++    const uint8_t * ref = nullptr;
++    size_t ref_size = 0;
+ 
+     struct write_info {
+         ggml_tensor * tensor;
+@@ -2995,6 +3053,7 @@ private:
+         size_t offset;
+     };
+     std::vector<write_info> winfos;
++    std::vector<write_info> rinfos;
+ };
+ 
+ class llama_io_read_host : public llama_io_read_i {
+@@ -3465,6 +3524,40 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
+     }
+ }
+ 
++size_t llama_context::state_seq_get_data_ref(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags,
++        const uint8_t * ref, size_t ref_size, size_t * n_reused) {
++    if (n_reused) {
++        *n_reused = 0;
++    }
++    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
++        return state_seq_get_data(seq_id, dst, size, flags);
++    }
++
++    size_t res = 0;
++    try {
++        llama_io_write_host io(dst, size, ref, ref_size);
++
++        io.write(&io_magic, sizeof(io_magic));
++        io.write(&seq_id, sizeof(seq_id));
++
++        res = state_seq_write_data(io, seq_id, flags);
++        if (n_reused) {
++            *n_reused = io.n_reused();
++        }
++        // io goes out of scope here: the remaining rows are read from the device
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
++        return 0;
++    }
++    return res;
++}
++
++void llama_context::state_seq_ref_mark(llama_seq_id seq_id) {
++    if (memory) {
++        memory->ref_mark(seq_id);
++    }
++}
++
+ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+     std::unique_ptr<llama_io_read_i> io;
+     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+@@ -4598,6 +4691,17 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+     return ctx->state_seq_set_data(seq_id, src, size, flags);
+ }
+ 
++size_t llama_state_seq_get_data_ref(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags,
++        const uint8_t * ref, size_t ref_size, size_t * n_reused) {
++    ctx->synchronize();
++
++    return ctx->state_seq_get_data_ref(seq_id, dst, size, flags, ref, ref_size, n_reused);
++}
++
++void llama_state_seq_ref_mark(llama_context * ctx, llama_seq_id seq_id) {
++    ctx->state_seq_ref_mark(seq_id);
++}
++
+ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 002378643c..44abbea1fe 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -163,6 +163,11 @@ struct llama_context {
+     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+ 
++    // [switchcost] prompt-cache delta save, see llama_state_seq_get_data_ref
++    size_t state_seq_get_data_ref(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags,
++            const uint8_t * ref, size_t ref_size, size_t * n_reused);
++    void   state_seq_ref_mark(llama_seq_id seq_id);
++
+     bool state_load_file(
+             const char * filepath,
+            llama_token * tokens_out,
+diff --git a/src/llama-io.h b/src/llama-io.h
+index f276af4fb9..9aef31d4c6 100644
+--- a/src/llama-io.h
++++ b/src/llama-io.h
+@@ -17,6 +17,15 @@ public:
+     // bytes written so far
+     virtual size_t n_bytes() = 0;
+ 
++    // [switchcost] prompt-cache delta save (LLAMA_PCACHE_KEEP): an optional host copy of an earlier state of the same
++    // sequence. A memory that knows which of its rows are unchanged since that copy was taken writes them with
++    // write_ref(): `src` points into the reference and holds the same bytes as tensor[offset, offset + size).
++    // The default falls back to reading the tensor.
++    virtual const uint8_t * get_ref(size_t & size) const { size = 0; return nullptr; }
++    virtual void write_ref(const uint8_t * /*src*/, ggml_tensor * tensor, size_t offset, size_t size) {
++        write_tensor(tensor, offset, size);
++    }
++
+     void write_string(const std::string & str);
+ };
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 58968e3920..b56d2f8fe5 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2306,12 +2306,149 @@ static bool llama_kv_ckpt_partial_skip() {
+     return v;
+ }
+ 
++// [switchcost] LLAMA_PCACHE_KEEP: see llama_memory_i::ref_mark. Only a plain (non-SWA) single-stream cache takes part.
++void llama_kv_cache::ref_mark(llama_seq_id seq_id) {
++    ref_seq = -1;
++    ref_n   = 0;
++    ref_row.clear();
++
++    if (other || seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || swa_type != LLAMA_SWA_TYPE_NONE || n_stream != 1) {
++        return;
++    }
++
++    const uint32_t strm = seq_to_stream[seq_id];
++    auto & cells = v_cells[strm];
++
++    cells.touch_clear();
++
++    // the rows of a state are written in ascending cell order (state_write), so row r of the reference is the r-th
++    // cell of the sequence
++    ref_row.assign(cells.size(), -1);
++    for (uint32_t i = 0; i < cells.size(); ++i) {
++        if (!cells.is_empty(i) && cells.seq_has(i, seq_id)) {
++            ref_row[i] = (int32_t) ref_n++;
++        }
++    }
++
++    ref_seq  = seq_id;
++    ref_strm = strm;
++}
++
++// parse the attention part of a reference state (as written by state_write for ref_seq) starting at `off`
++bool llama_kv_cache::ref_parse(const uint8_t * ref, size_t ref_size, size_t off, ref_layout & rl) const {
++    size_t p = off;
++    auto rd = [&](void * dst, size_t n) -> bool {
++        if (p + n > ref_size) {
++            return false;
++        }
++        memcpy(dst, ref + p, n);
++        p += n;
++        return true;
++    };
++
++    uint32_t n_stream_ref = 0;
++    if (!rd(&n_stream_ref, sizeof(n_stream_ref)) || n_stream_ref != 1 || n_stream != 1) {
++        return false;
++    }
++
++    uint32_t cell_count = 0;
++    if (!rd(&cell_count, sizeof(cell_count)) || cell_count == 0 || cell_count != ref_n) {
++        return false;
++    }
++
++    rl.base = ref;
++    rl.pos.resize(cell_count);
++    for (uint32_t r = 0; r < cell_count; ++r) {
++        llama_pos pos;
++        uint32_t  n_seq_id;
++        if (!rd(&pos, sizeof(pos)) || !rd(&n_seq_id, sizeof(n_seq_id))) {
++            return false;
++        }
++        if (has_cell_ext()) {
++            p += sizeof(llama_kv_cell_ext);
++        }
++        p += (size_t) n_seq_id * sizeof(llama_seq_id);
++        if (p > ref_size) {
++            return false;
++        }
++        rl.pos[r] = pos;
++    }
++
++    uint32_t v_trans_ref = 0;
++    uint32_t n_layer_ref = 0;
++    if (!rd(&v_trans_ref, sizeof(v_trans_ref)) || !rd(&n_layer_ref, sizeof(n_layer_ref))) {
++        return false;
++    }
++    if (v_trans_ref != 0 || v_trans || n_layer_ref != layers.size()) {
++        return false;
++    }
++
++    rl.k_off.assign(layers.size(), SIZE_MAX);
++    rl.k_row.assign(layers.size(), 0);
++    rl.v_off.assign(layers.size(), SIZE_MAX);
++    rl.v_row.assign(layers.size(), 0);
++
++    for (size_t l = 0; l < layers.size(); ++l) {
++        int32_t  type;
++        uint64_t row;
++        if (!rd(&type, sizeof(type)) || !rd(&row, sizeof(row))) {
++            return false;
++        }
++        if (p + (size_t) cell_count * row > ref_size) {
++            return false;
++        }
++        const auto * k = layers[l].k_stream[ref_strm];
++        if (type == (int32_t) k->type && row == ggml_row_size(k->type, hparams.n_embd_k_gqa(layers[l].il))) {
++            rl.k_off[l] = p;
++            rl.k_row[l] = row;
++        }
++        p += (size_t) cell_count * row;
++    }
++
++    for (size_t l = 0; l < layers.size(); ++l) {
++        const auto * v = layers[l].v_stream[ref_strm];
++        if (!v) {
++            continue;
++        }
++        int32_t  type;
++        uint64_t row;
++        if (!rd(&type, sizeof(type)) || !rd(&row, sizeof(row))) {
++            return false;
++        }
++        if (p + (size_t) cell_count * row > ref_size) {
++            return false;
++        }
++        if (type == (int32_t) v->type && row == ggml_row_size(v->type, hparams.n_embd_v_gqa(layers[l].il))) {
++            rl.v_off[l] = p;
++            rl.v_row[l] = row;
++        }
++        p += (size_t) cell_count * row;
++    }
++
++    return true;
++}
++
+ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         return;
+     }
+ 
++    // [switchcost] a reference state of the same sequence, see ref_mark(); the attention part of a state starts at the
++    // same offset in the reference as here (right after the fixed 8-byte sequence header)
++    ref_layout rl;
++    bool use_ref = false;
++    {
++        size_t ref_size = 0;
++        const uint8_t * ref = io.get_ref(ref_size);
++        if (ref && seq_id >= 0 && seq_id == ref_seq && flags == LLAMA_STATE_SEQ_FLAGS_NONE && io.n_bytes() == 8) {
++            use_ref = ref_parse(ref, ref_size, io.n_bytes(), rl);
++            if (!use_ref) {
++                LLAMA_LOG_WARN("%s: [pcache] reference state does not match the cache layout - writing the full state\n", __func__);
++            }
++        }
++    }
++
+     io.write(&n_stream, sizeof(n_stream));
+ 
+     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && seq_id >= 0 && swa_type == LLAMA_SWA_TYPE_NONE &&
+@@ -2380,7 +2517,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
+         }
+ 
+         state_write_meta(io, cr, seq_id);
+-        state_write_data(io, cr);
++        state_write_data(io, cr, use_ref && s == ref_strm ? &rl : nullptr);
+     }
+ }
+ 
+@@ -2497,7 +2634,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
+     }
+ }
+ 
+-void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
++void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr, const ref_layout * rl) const {
+     const auto & cells = v_cells[cr.strm];
+ 
+     const uint32_t v_trans = this->v_trans ? 1 : 0;
+@@ -2506,6 +2643,50 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
+     io.write(&v_trans, sizeof(v_trans));
+     io.write(&n_layer, sizeof(n_layer));
+ 
++    // [switchcost] runs of cells in write order: {first cell, count, reference row of the first cell or -1}. A cell is
++    // taken from the reference when it was in the reference at mark time, has not been touched since and still has
++    // the position it had there.
++    struct run_t { uint32_t c0; uint32_t n; int64_t r0; };
++    std::vector<run_t> runs;
++    if (rl) {
++        for (const auto & range : cr.data) {
++            for (uint32_t i = range.first; i < range.second; ++i) {
++                int64_t r = -1;
++                if (i < ref_row.size() && ref_row[i] >= 0 && !cells.is_touched(i) &&
++                    rl->pos[ref_row[i]] == cells.pos_get(i)) {
++                    r = ref_row[i];
++                }
++                if (!runs.empty()) {
++                    auto & b = runs.back();
++                    const bool cont_cell = b.c0 + b.n == i;
++                    const bool cont_ref  = (b.r0 < 0 && r < 0) || (b.r0 >= 0 && r == b.r0 + b.n);
++                    if (cont_cell && cont_ref) {
++                        b.n++;
++                        continue;
++                    }
++                }
++                runs.push_back({ i, 1, r });
++            }
++        }
++    }
++
++    auto write_rows = [&](ggml_tensor * t, uint64_t size_row, size_t ref_off) {
++        if (!rl || ref_off == SIZE_MAX) {
++            for (const auto & range : cr.data) {
++                const size_t range_size = range.second - range.first;
++                io.write_tensor(t, range.first * size_row, range_size * size_row);
++            }
++            return;
++        }
++        for (const auto & run : runs) {
++            if (run.r0 >= 0) {
++                io.write_ref(rl->base + ref_off + (size_t) run.r0 * size_row, t, (size_t) run.c0 * size_row, (size_t) run.n * size_row);
++            } else {
++                io.write_tensor(t, (size_t) run.c0 * size_row, (size_t) run.n * size_row);
++            }
++        }
++    };
++
+     // Iterate and write all the keys first, each row is a cell
+     // Get whole range at a time
+     for (const auto & layer : layers) {
+@@ -2524,11 +2705,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
+         io.write(&k_size_row, sizeof(k_size_row));
+ 
+         // Read each range of cells of k_size length and write out
+-        for (const auto & range : cr.data) {
+-            const size_t range_size = range.second - range.first;
+-            const size_t buf_size = range_size * k_size_row;
+-            io.write_tensor(k, range.first * k_size_row, buf_size);
+-        }
++        write_rows(k, k_size_row, rl ? rl->k_off[&layer - layers.data()] : SIZE_MAX);
+     }
+ 
+     if (!v_trans) {
+@@ -2551,11 +2728,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
+             io.write(&v_size_row, sizeof(v_size_row));
+ 
+             // Read each range of cells of v_size length and write out
+-            for (const auto & range : cr.data) {
+-                const size_t range_size = range.second - range.first;
+-                const size_t buf_size = range_size * v_size_row;
+-                io.write_tensor(v, range.first * v_size_row, buf_size);
+-            }
++            write_rows(v, v_size_row, rl ? rl->v_off[&layer - layers.data()] : SIZE_MAX);
+         }
+     } else {
+         // When v is transposed, we also need the element size and get the element ranges from each row
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index e1232c406b..1b5dbef2f4 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -155,6 +155,8 @@ public:
+     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+ 
++    void ref_mark(llama_seq_id seq_id) override;
++
+     //
+     // llama_kv_cache specific API
+     //
+@@ -344,8 +346,27 @@ private:
+         std::vector<std::pair<uint32_t, uint32_t>> data; // ranges, from inclusive, to exclusive
+     };
+ 
++    // [switchcost] where the rows of an earlier host copy of the state (the reference) are, see ref_mark()
++    struct ref_layout {
++        const uint8_t * base = nullptr;
++        std::vector<llama_pos> pos;        // position of each reference row
++        std::vector<size_t>    k_off;      // per layer: offset of the first K row in the reference, SIZE_MAX = unusable
++        std::vector<uint64_t>  k_row;
++        std::vector<size_t>    v_off;
++        std::vector<uint64_t>  v_row;
++    };
++
++    bool ref_parse(const uint8_t * ref, size_t ref_size, size_t off, ref_layout & rl) const;
++
+     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
+-    void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
++    void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr, const ref_layout * rl = nullptr) const;
++
++    // [switchcost] reference tracking (LLAMA_PCACHE_KEEP): the sequence whose cells were marked, its stream and the
++    // reference row of every cell at mark time (-1 = not in the reference)
++    llama_seq_id          ref_seq  = -1;
++    uint32_t              ref_strm = 0;
++    uint32_t              ref_n    = 0;
++    std::vector<int32_t>  ref_row;
+ 
+     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
+     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
+diff --git a/src/llama-kv-cells.h b/src/llama-kv-cells.h
+index e6fb935c52..d53ec7019f 100644
+--- a/src/llama-kv-cells.h
++++ b/src/llama-kv-cells.h
+@@ -3,6 +3,7 @@
+ #include "llama.h"
+ #include "llama-cparams.h"
+ 
++#include <algorithm>
+ #include <bitset>
+ #include <cassert>
+ #include <cstring>
+@@ -49,6 +50,8 @@ public:
+ 
+         used.clear();
+ 
++        std::fill(touched.begin(), touched.end(), 1);
++
+         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+             seq_pos[s].clear();
+         }
+@@ -71,6 +74,7 @@ public:
+         ext.resize(n);
+         shift.resize(n);
+         seq.resize(n);
++        touched.resize(n);
+ 
+         reset();
+     }
+@@ -127,6 +131,19 @@ public:
+         return has_shift;
+     }
+ 
++    // [switchcost] per-cell change tracking for the prompt-cache delta save (LLAMA_PCACHE_KEEP): every method that
++    // changes the metadata of a cell - and with it, everything that writes K/V data into the cell (apply_ubatch,
++    // state restore) or changes it (K-shift after pos_add / pos_div) - marks the cell as touched. touch_clear() is
++    // called when the cells are known to hold exactly the data of a host copy of the state.
++    void touch_clear() {
++        std::fill(touched.begin(), touched.end(), 0);
++    }
++
++    bool is_touched(uint32_t i) const {
++        assert(i < touched.size());
++        return touched[i] != 0;
++    }
++
+     // move cell isrc to idst (used during defrag)
+     //void mv(uint32_t isrc, uint32_t idst) {
+     //    assert(isrc < pos.size());
+@@ -194,6 +211,8 @@ public:
+         for (uint32_t j = 0; j < other.pos.size(); ++j) {
+             const auto idx = i + j;
+ 
++            touched[idx] = 1;
++
+             if (pos[idx] == -1 && other.pos[j] != -1) {
+                 used.insert(i + j);
+             }
+@@ -225,6 +244,8 @@ public:
+         for (uint32_t j = 0; j < other.pos.size(); ++j) {
+             const auto idx = idxs[j];
+ 
++            touched[idx] = 1;
++
+             if (pos[idx] == -1 && other.pos[j] != -1) {
+                 used.insert(idx);
+             }
+@@ -254,6 +275,8 @@ public:
+         assert(i < pos.size());
+         assert(pos[i] != -1);
+ 
++        touched[i] = 1;
++
+         seq_pos_rm(i);
+         seq[i].reset();
+ 
+@@ -272,6 +295,8 @@ public:
+         assert(pos[i] != -1);
+         assert(seq_id >= 0);
+ 
++        touched[i] = 1;
++
+         seq[i].reset(seq_id);
+         seq_pos_dec(seq_id, i);
+ 
+@@ -292,6 +317,8 @@ public:
+     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
+         assert(i < pos.size());
+ 
++        touched[i] = 1;
++
+         if (seq[i].test(seq_id)) {
+             seq_pos_rm(i);
+             seq[i].reset();
+@@ -367,6 +394,8 @@ public:
+         assert(pos[i] != -1);
+         assert(!seq[i].test(seq_id));
+ 
++        touched[i] = 1;
++
+         seq[i].set(seq_id);
+         seq_pos_inc(seq_id, i);
+     }
+@@ -449,6 +478,8 @@ public:
+         assert(pos[i] == -1);
+         assert(seq[i].none());
+ 
++        touched[i] = 1;
++
+         pos[i] = p;
+ 
+         used.insert(i);
+@@ -456,6 +487,7 @@ public:
+ 
+     void ext_set(uint32_t i, llama_kv_cell_ext p) {
+         assert(i < ext.size());
++        touched[i] = 1;
+         ext[i] = p;
+     }
+ 
+@@ -466,6 +498,8 @@ public:
+         assert(i < pos.size());
+         assert(pos[i] != -1);
+ 
++        touched[i] = 1;
++
+         seq_pos_rm(i);
+ 
+         pos[i]   += d;
+@@ -497,6 +531,8 @@ public:
+ 
+         const llama_pos p_old = pos[i];
+ 
++        touched[i] = 1;
++
+         seq_pos_rm(i);
+ 
+         pos[i]   /= d;
+@@ -538,6 +574,9 @@ private:
+     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
+     std::vector<seq_set_t> seq;
+ 
++    // [switchcost] see touch_clear()
++    std::vector<uint8_t> touched;
++
+     // the set seq_pos[s] holds one (pos, cell) pair per cell that carries sequence s, ordered by position
+     // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
+     // and upper_bound() on a position finds the nearest cell of the sequence in logarithmic time
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 42c7381a9e..4b0bf9dea7 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -201,6 +201,11 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id,
+     mem_recr->state_read(io, seq_id, flags);
+ }
+ 
++void llama_memory_hybrid::ref_mark(llama_seq_id seq_id) {
++    // the recurrent part is always written in full; only the attention KV rows can be reused
++    mem_attn->ref_mark(seq_id);
++}
++
+ llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
+     return mem_attn.get();
+ }
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 484eafb749..df826266c0 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -76,6 +76,8 @@ public:
+     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
+ 
++    void ref_mark(llama_seq_id seq_id) override;
++
+     //
+     // llama_memory_hybrid specific API
+     //
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index db82539664..dbc7dce909 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -124,6 +124,10 @@ struct llama_memory_i {
+ 
+     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
+     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
++
++    // [switchcost] the data of seq_id now equals a host copy of its state (just saved or restored): start tracking
++    // which rows change from here on, so a later state_write with that copy as reference can skip unchanged rows
++    virtual void ref_mark(llama_seq_id /*seq_id*/) {}
+ };
+ 
+ using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index a874f52dbf..165053a750 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -946,6 +946,7 @@ server_tokens process_mtmd_prompt(
+     // these will be freed upon going out of scope
+     mtmd::bitmaps bitmaps;
+     std::vector<mtmd_helper::video_ptr> videos;
++    const int64_t sw0 = ggml_time_us(); // [switchcost]
+     for (auto & file : files) {
+         auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
+         if (!out.bitmap) {
+@@ -967,6 +968,7 @@ server_tokens process_mtmd_prompt(
+     };
+     mtmd::input_chunks chunks(mtmd_input_chunks_init());
+     auto bitmaps_c_ptr = bitmaps.c_ptr();
++    const int64_t sw1 = ggml_time_us();
+     int32_t tokenized = mtmd_tokenize(mctx,
+                                       chunks.ptr.get(),
+                                       &inp_txt,
+@@ -975,6 +977,10 @@ server_tokens process_mtmd_prompt(
+     if (tokenized != 0) {
+         throw std::runtime_error("Failed to tokenize prompt");
+     }
++    if (common_swp_on()) {
++        common_swp("mtmd prompt: %zu file(s) decode+hash %.1f ms, mtmd_tokenize (text + image preprocess) %.1f ms",
++                files.size(), (sw1 - sw0) / 1000.0, (ggml_time_us() - sw1) / 1000.0);
++    }
+     auto result = server_tokens(chunks, true);
+     return result;
+ }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 5700ce7855..c4b7116745 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -300,42 +300,102 @@ struct server_slot {
+     server_prompt prompt;
+ 
+     // `keep` is the cached state that is going to be loaded into this slot right after saving (see server_prompt_cache::alloc)
+-    bool prompt_save(server_prompt_cache & prompt_cache, const server_prompt_cache_state * keep = nullptr) const {
++    // [switchcost] checkpoints with pos_max > ckpt_move_pos are moved into the cache entry (LLAMA_PCACHE_CKPT_MOVE)
++    bool prompt_save(server_prompt_cache & prompt_cache, const server_prompt_cache_state * keep = nullptr,
++            llama_pos ckpt_move_pos = std::numeric_limits<llama_pos>::max()) {
+         if (prompt.tokens.size() == 0) {
+             return false;
+         }
+ 
+         const bool hp = llama_hprof_enabled(); // [prefill2] LLAMA_HOST_PROF: prompt-cache save split
+         int64_t hp_t0 = hp ? ggml_time_us() : 0;
++        const bool swp = common_swp_on(); // [switchcost]
++        const int64_t sw0 = ggml_time_us();
+         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+         if (hp) { llama_hprof_record("psave.size", hp_t0); hp_t0 = ggml_time_us(); }
++        const int64_t sw1 = ggml_time_us();
+ 
+         const size_t cur_size = cur_size_tgt + cur_size_dft;
+ 
+         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+ 
+-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, keep);
++        size_t n_ckpt = 0;
++        size_t n_ckpt_move = 0;
++        size_t ckpt_bytes = 0;
++        for (const auto & ckpt : prompt.checkpoints) {
++            n_ckpt++;
++            n_ckpt_move += ckpt.pos_max > ckpt_move_pos;
++            ckpt_bytes += ckpt.size();
++        }
++
++        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, keep, ckpt_move_pos);
+         if (hp) { llama_hprof_record("psave.alloc", hp_t0); hp_t0 = ggml_time_us(); }
++        const int64_t sw2 = ggml_time_us();
+         if (cur == nullptr) {
++            if (swp) {
++                common_swp("save skipped (%d tokens already cached or over the limit) | size %.1f alloc %.1f ms",
++                        (int) prompt.tokens.size(), (sw1 - sw0) / 1000.0, (sw2 - sw1) / 1000.0);
++            }
+             return false;
+         }
+ 
+-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        // [switchcost] LLAMA_PCACHE_KEEP: rows unchanged since this slot's last restore come from the shadow copy
++        static const int keep_mode = server_pcache_env("LLAMA_PCACHE_KEEP");
++        const bool use_ref = keep_mode > 0 && prompt_cache.shadow_slot == id;
++        size_t reused_tgt = 0;
++        size_t reused_dft = 0;
++
++        if (use_ref) {
++            llama_state_seq_get_data_ref(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE,
++                    prompt_cache.shadow.main.data(), prompt_cache.shadow.main.size(), &reused_tgt);
++        } else {
++            llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        }
+         if (hp) { llama_hprof_record("psave.get_tgt", hp_t0); hp_t0 = ggml_time_us(); }
++        const int64_t sw3 = ggml_time_us();
+         if (ctx_dft) {
+-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            if (use_ref && !prompt_cache.shadow.drft.empty()) {
++                llama_state_seq_get_data_ref(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE,
++                        prompt_cache.shadow.drft.data(), prompt_cache.shadow.drft.size(), &reused_dft);
++            } else {
++                llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++            }
+         }
+         if (hp) { llama_hprof_record("psave.get_dft", hp_t0); }
++        const int64_t sw4 = ggml_time_us();
++
++        // [switchcost] LLAMA_PCACHE_KEEP=2: the saved bytes must equal a plain full read of the state
++        if (keep_mode >= 2) {
++            server_pcache_verify_state("save", ctx_tgt, ctx_dft, id, cur->data);
++        }
++
++        // the new entry holds the current state: the shadow of this slot is no longer needed
++        if (prompt_cache.shadow_slot == id) {
++            prompt_cache.shadow_drop();
++        }
++
++        if (swp) {
++            common_swp("save %d tokens: tgt %.1f MiB (%.1f reused), dft %.1f MiB (%.1f reused), %zu ckpt %.1f MiB (%zu moved) | "
++                    "size %.1f alloc %.1f get_tgt %.1f get_dft %.1f ms",
++                    (int) cur->prompt.tokens.size(), cur_size_tgt / 1048576.0, reused_tgt / 1048576.0,
++                    cur_size_dft / 1048576.0, reused_dft / 1048576.0, n_ckpt, ckpt_bytes / 1048576.0, n_ckpt_move,
++                    (sw1 - sw0) / 1000.0, (sw2 - sw1) / 1000.0, (sw3 - sw2) / 1000.0, (sw4 - sw3) / 1000.0);
++        }
+ 
+         return true;
+     }
+ 
+     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+         const int64_t hp_t0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2]
++        const int64_t sw0 = ggml_time_us();
+         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+         if (hp_t0) llama_hprof_record("pload", hp_t0);
++        if (common_swp_on()) {
++            common_swp("load done: slot has %d tokens, %zu ckpt | %.1f ms", prompt.n_tokens(), prompt.checkpoints.size(),
++                    (ggml_time_us() - sw0) / 1000.0);
++        }
+         if (!res) {
+             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+         }
+@@ -777,6 +837,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
+                 };
+ 
+                 llama_pos new_n_past; // unused for now
++                const int64_t sw_dec = ggml_time_us(); // [switchcost]
+                 res = mtmd_helper_decode_image_chunk(
+                     mctx,
+                     slot.ctx_tgt,
+@@ -794,6 +855,9 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
+                     return -1;
+                 }
+                 n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
++                if (common_swp_on()) {
++                    common_swp("mtmd decode into the LLM: %zu tokens | %.1f ms", n_tokens_out, (ggml_time_us() - sw_dec) / 1000.0);
++                }
+                 return 0; // success
+             }
+         }
+@@ -834,7 +898,11 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
+     // TODO @ngxson : move this log line to debug when it become more stable
+     SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
+ 
++    const int64_t sw_enc = ggml_time_us(); // [switchcost]
+     res = mtmd_batch_encode(mbatch.get());
++    if (common_swp_on()) {
++        common_swp("mtmd encode: %d chunk(s) from idx %zu | %.1f ms", n_added, idx, (ggml_time_us() - sw_enc) / 1000.0);
++    }
+     if (res != 0) {
+         SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
+         return -1;
+@@ -1614,6 +1682,11 @@ private:
+             if (ret != nullptr) {
+                 const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+ 
++                if (common_swp_on()) {
++                    common_swp("slot select: LCP sim %.3f of %d new tokens, f_keep %.3f of %d slot tokens",
++                            f_sim_best, (int) task.tokens.size(), f_keep, (int) ret->prompt.tokens.size());
++                }
++
+                 if (task.id_slot == -1) {
+                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                             f_sim_best, slot_prompt_similarity, f_keep);
+@@ -1676,13 +1749,28 @@ private:
+ 
+             update_cache = update_cache && can_cache;
+ 
++            if (common_swp_on()) {
++                common_swp("prompt cache: %zu entries, better match %s (%d tokens), update %d",
++                        prompt_cache ? prompt_cache->states.size() : (size_t) 0, better ? "yes" : "no",
++                        better ? better->prompt.n_tokens() : 0, (int) update_cache);
++            }
++
+             if (update_cache) {
+                 SRV_TRC("%s", "updating prompt cache\n");
+ 
+                 const int64_t t_start = ggml_time_us();
+ 
++                // [switchcost] LLAMA_PCACHE_CKPT_MOVE: the slot's checkpoints are replaced by the restored ones
++                static const bool ckpt_move = server_pcache_env("LLAMA_PCACHE_CKPT_MOVE") > 0;
++
++                // the slot drops every checkpoint when `better` is restored, else those past the common prefix
++                llama_pos move_pos = std::numeric_limits<llama_pos>::max();
++                if (ckpt_move) {
++                    move_pos = better ? -1 : ret->prompt.tokens.pos_next(ret->prompt.tokens.get_common_prefix(task.tokens));
++                }
++
+                 // note: `better` is protected from eviction while the current state is being saved
+-                ret->prompt_save(*prompt_cache, better);
++                ret->prompt_save(*prompt_cache, better, move_pos);
+ 
+                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                     ret->prompt_clear();
+@@ -1691,6 +1779,9 @@ private:
+                 prompt_cache->update();
+ 
+                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
++                if (common_swp_on()) {
++                    common_swp("prompt cache update done | %.1f ms", (ggml_time_us() - t_start) / 1000.0);
++                }
+             }
+         }
+ 
+@@ -1865,6 +1956,9 @@ private:
+         n_empty_consecutive = 0;
+ 
+         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
++        if (common_swp_on()) {
++            common_swp("task %d launched", slot.task->id);
++        }
+         return true;
+     }
+ 
+@@ -2437,8 +2531,16 @@ private:
+ 
+                     const int id_task = task.id;
+ 
++                    if (common_swp_on()) {
++                        common_swp("task %d dequeued (%d tokens)", id_task, (int) task.tokens.size());
++                    }
++
+                     server_slot * slot = get_available_slot(task);
+ 
++                    if (common_swp_on()) {
++                        common_swp("task %d slot chosen", id_task);
++                    }
++
+                     //
+                     // slot scheduling logic
+                     //
+@@ -3239,6 +3341,10 @@ private:
+                     if (slot.state == SLOT_STATE_STARTED) {
+                         slot.stats.update_prompt_start();
+ 
++                        if (common_swp_on()) {
++                            common_swp("prompt start (task %d, %d tokens) = timings.prompt_ms t0", slot.task->id, slot.task->n_tokens());
++                        }
++
+                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+ 
+                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
+@@ -3463,6 +3569,7 @@ private:
+ 
+                                     if (!do_reset) {
+                                         // restore the context checkpoint
++                                        const int64_t sw_cr = ggml_time_us(); // [switchcost]
+                                         const int64_t hp_cr0 = llama_hprof_enabled() ? ggml_time_us() : 0; // [prefill2]
+                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                         if (hp_cr0) llama_hprof_record("srv.ckpt.restore.tgt", hp_cr0);
+@@ -3475,6 +3582,10 @@ private:
+                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
++                                        if (common_swp_on()) {
++                                            common_swp("checkpoint restored (n_tokens %" PRId64 ", %.1f MiB) | %.1f ms", it->n_tokens,
++                                                    it->size() / 1048576.0, (ggml_time_us() - sw_cr) / 1000.0);
++                                        }
+                                     }
+ 
+                                     if (do_reset) {
+@@ -3510,6 +3621,11 @@ private:
+                         slot.stats.n_prompt_cached    = n_past;
+                         slot.stats.n_prompt_processed = 0;
+ 
++                        if (common_swp_on()) {
++                            common_swp("n_past %d of %d (slot kept %d, %zu ckpt)", n_past, slot.task->n_tokens(),
++                                    slot.prompt.n_tokens(), slot.prompt.checkpoints.size());
++                        }
++
+                         metrics.add_prompt_cached(n_past);
+ 
+                         slot.prompt.tokens.keep_first(n_past);
+@@ -3984,6 +4100,9 @@ private:
+ 
+             if (slot.stats.n_gen == 1) {
+                 slot.stats.update_prompt_last();
++                if (common_swp_on()) {
++                    common_swp("first token sampled (task %d)", slot.task->id);
++                }
+                 slot.t_print_last = t_now;
+                 slot.n_gen_last = 0;
+             }
+@@ -4432,6 +4551,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+         // process prompt
+         std::vector<server_tokens> inputs;
+ 
++        const int64_t sw_tok = ggml_time_us(); // [switchcost]
+         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
+             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+@@ -4439,6 +4559,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             // Everything else, including multimodal completions.
+             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+         }
++        if (common_swp_on()) {
++            common_swp("http tokenize (%zu files, %d tokens) %.1f ms", files.size(),
++                    inputs.empty() ? 0 : (int) inputs[0].size(), (ggml_time_us() - sw_tok) / 1000.0);
++        }
+ 
+         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
+ 
+@@ -5069,13 +5193,22 @@ void server_routes::init_routes() {
+     };
+ 
+     this->post_chat_completions = [this](const server_http_req & req) {
++        const int64_t sw0 = ggml_time_us(); // [switchcost]
++        if (common_swp_on()) {
++            common_swp("http chat request received (%zu bytes)", req.body.size());
++        }
+         auto res = create_response();
+         std::vector<raw_buffer> files;
+         json body = json::parse(req.body);
++        const int64_t sw1 = ggml_time_us();
+         json body_parsed = oaicompat_chat_params_parse(
+             body,
+             meta->chat_params,
+             files);
++        if (common_swp_on()) {
++            common_swp("http json parse %.1f ms, chat template + files (%zu) %.1f ms", (sw1 - sw0) / 1000.0, files.size(),
++                    (ggml_time_us() - sw1) / 1000.0);
++        }
+         return handle_completions_impl(
+             req,
+             SERVER_TASK_TYPE_COMPLETION,
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 74e8537f99..0d5991cea6 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -11,6 +11,10 @@
+ #include "server-common.h"
+ 
+ #include <sstream>
++#include <mutex>
++#include <algorithm>
++
++#include "ggml-backend.h"
+ 
+ //
+ // task_params
+@@ -1685,6 +1689,246 @@ json server_task_result_apply_lora::to_json() {
+     return json {{ "success", true }};
+ }
+ 
++//
++// [switchcost] prompt-cache state buffers and their reuse pool
++//
++int server_pcache_env(const char * name) {
++    const char * e = getenv(name);
++    return e ? atoi(e) : 0;
++}
++
++static int server_pcache_pool_mode() {
++    static const int v = server_pcache_env("LLAMA_PCACHE_POOL");
++    return v;
++}
++
++namespace {
++struct pcache_block {
++    ggml_backend_buffer_t buf  = nullptr;
++    uint8_t *             base = nullptr;
++    size_t                cap  = 0;
++};
++
++struct pcache_pool {
++    std::mutex mtx;
++    std::vector<pcache_block *> free_blocks;
++    size_t free_bytes  = 0;
++    size_t total_bytes = 0;
++    ggml_backend_buffer_type_t buft = nullptr;
++    bool buft_init = false;
++};
++
++pcache_pool & pcache_pool_get() {
++    static pcache_pool * p = new pcache_pool(); // never destroyed: states may be released during static destruction
++    return *p;
++}
++
++constexpr size_t PCACHE_BLOCK_ALIGN = 64ull << 20;
++
++size_t pcache_block_cap(size_t n) {
++    n = std::max<size_t>(n, 1);
++    n += n/8;
++    return ((n + PCACHE_BLOCK_ALIGN - 1) / PCACHE_BLOCK_ALIGN) * PCACHE_BLOCK_ALIGN;
++}
++
++// pinned host memory of the first GPU (mode 1), or plain host memory (mode 2 / no GPU host buffer type)
++ggml_backend_buffer_type_t pcache_buft(pcache_pool & pool) {
++    if (!pool.buft_init) {
++        pool.buft_init = true;
++        if (server_pcache_pool_mode() == 1) {
++            ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++            if (dev) {
++                pool.buft = ggml_backend_dev_host_buffer_type(dev);
++            }
++        }
++        if (!pool.buft) {
++            pool.buft = ggml_backend_cpu_buffer_type();
++        }
++        SRV_INF("[pcache] pool buffer type: %s\n", ggml_backend_buft_name(pool.buft));
++    }
++    return pool.buft;
++}
++
++pcache_block * pcache_acquire(size_t n, bool only_free = false) {
++    auto & pool = pcache_pool_get();
++    std::lock_guard<std::mutex> lk(pool.mtx);
++
++    // the smallest free block that holds n bytes and does not waste more than half of n (+ 128 MiB)
++    size_t best = SIZE_MAX;
++    for (size_t i = 0; i < pool.free_blocks.size(); ++i) {
++        const size_t cap = pool.free_blocks[i]->cap;
++        if (cap >= n && cap <= n + n/2 + (128ull << 20) && (best == SIZE_MAX || cap < pool.free_blocks[best]->cap)) {
++            best = i;
++        }
++    }
++    if (best != SIZE_MAX) {
++        pcache_block * b = pool.free_blocks[best];
++        pool.free_blocks.erase(pool.free_blocks.begin() + best);
++        pool.free_bytes -= b->cap;
++        return b;
++    }
++    if (only_free) {
++        return nullptr;
++    }
++
++    // 1/8 headroom: the block of a growing conversation can be reused for its next saves
++    const size_t cap = pcache_block_cap(n);
++    const int64_t t0 = ggml_time_us();
++    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(pcache_buft(pool), cap);
++    if (!buf) {
++        return nullptr;
++    }
++    auto * b = new pcache_block();
++    b->buf  = buf;
++    b->base = (uint8_t *) ggml_backend_buffer_get_base(buf);
++    b->cap  = cap;
++    pool.total_bytes += cap;
++    SRV_INF("[pcache] new pool block %.1f MiB (%s) in %.1f ms, pool total %.1f MiB\n", cap / 1048576.0,
++            ggml_backend_buffer_name(buf), (ggml_time_us() - t0) / 1000.0, pool.total_bytes / 1048576.0);
++    return b;
++}
++
++void pcache_give(pcache_block * b) {
++    auto & pool = pcache_pool_get();
++    std::lock_guard<std::mutex> lk(pool.mtx);
++    pool.free_blocks.push_back(b);
++    pool.free_bytes += b->cap;
++}
++} // namespace
++
++size_t server_pcache_pool_free() {
++    auto & pool = pcache_pool_get();
++    std::lock_guard<std::mutex> lk(pool.mtx);
++    return pool.free_bytes;
++}
++
++size_t server_pcache_pool_trim(size_t n_bytes) {
++    auto & pool = pcache_pool_get();
++    std::lock_guard<std::mutex> lk(pool.mtx);
++    size_t freed = 0;
++    // largest blocks first
++    std::sort(pool.free_blocks.begin(), pool.free_blocks.end(), [](const pcache_block * a, const pcache_block * b) { return a->cap > b->cap; });
++    while (freed < n_bytes && !pool.free_blocks.empty()) {
++        pcache_block * b = pool.free_blocks.front();
++        pool.free_blocks.erase(pool.free_blocks.begin());
++        pool.free_bytes  -= b->cap;
++        pool.total_bytes -= b->cap;
++        freed += b->cap;
++        SRV_INF("[pcache] releasing pool block %.1f MiB\n", b->cap / 1048576.0);
++        ggml_backend_buffer_free(b->buf);
++        delete b;
++    }
++    return freed;
++}
++
++server_state_buf::server_state_buf(server_state_buf && other) noexcept {
++    *this = std::move(other);
++}
++
++server_state_buf & server_state_buf::operator=(server_state_buf && other) noexcept {
++    if (this != &other) {
++        release();
++        vec = std::move(other.vec);
++        ptr = other.ptr;
++        n   = other.n;
++        cap = other.cap;
++        blk = other.blk;
++        other.vec = std::vector<uint8_t>();
++        other.ptr = nullptr;
++        other.n   = 0;
++        other.cap = 0;
++        other.blk = nullptr;
++    }
++    return *this;
++}
++
++server_state_buf::~server_state_buf() {
++    release();
++}
++
++void server_pcache_verify_state(const char * what, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id,
++        const server_prompt_data & data) {
++    auto check = [&](const char * part, llama_context * ctx, const server_state_buf & buf) {
++        if (!ctx || buf.empty()) {
++            return;
++        }
++        const size_t n = llama_state_seq_get_size_ext(ctx, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        std::vector<uint8_t> tmp(n);
++        const size_t got = llama_state_seq_get_data_ext(ctx, tmp.data(), n, id, LLAMA_STATE_SEQ_FLAGS_NONE);
++        const bool same = got == buf.size() && memcmp(tmp.data(), buf.data(), buf.size()) == 0;
++        SRV_WRN("[pcache] state check after %s: %s %.1f MiB %s\n", what, part, buf.size() / 1048576.0,
++                same ? "identical" : "DIFFERENT");
++        if (!same) {
++            GGML_ABORT("[pcache] state check failed");
++        }
++    };
++    check("tgt", ctx_tgt, data.main);
++    check("dft", ctx_dft, data.drft);
++}
++
++bool server_pcache_pool_on() {
++    return server_pcache_pool_mode() != 0;
++}
++
++size_t server_pcache_block_size(size_t n) {
++    return n == 0 ? 0 : pcache_block_cap(n);
++}
++
++bool server_state_buf::alloc_pooled(size_t size) {
++    release();
++    if (server_pcache_pool_mode() == 0 || size == 0) {
++        return false;
++    }
++    auto * b = pcache_acquire(size, /*only_free =*/ true);
++    if (!b) {
++        return false;
++    }
++    blk = b;
++    ptr = b->base;
++    n   = size;
++    cap = b->cap;
++    return true;
++}
++
++bool server_state_buf::alloc(size_t size) {
++    release();
++    if (server_pcache_pool_mode() == 0 || size == 0) {
++        // as before: a fresh, zero-filled vector
++        try {
++            std::vector<uint8_t> v;
++            v.resize(size);
++            vec.swap(v);
++        } catch (const std::bad_alloc &) {
++            return false;
++        }
++        ptr = vec.data();
++        n   = size;
++        cap = vec.capacity();
++        return true;
++    }
++    auto * b = pcache_acquire(size);
++    if (!b) {
++        return false;
++    }
++    blk = b;
++    ptr = b->base;
++    n   = size;
++    cap = b->cap;
++    return true;
++}
++
++void server_state_buf::release() {
++    if (blk) {
++        pcache_give((pcache_block *) blk);
++        blk = nullptr;
++    } else {
++        vec = std::vector<uint8_t>();
++    }
++    ptr = nullptr;
++    n   = 0;
++    cap = 0;
++}
++
+ //
+ // server_prompt_cache
+ //
+@@ -1692,10 +1936,56 @@ size_t server_prompt_cache::size() const {
+     size_t res = 0;
+ 
+     for (const auto & state : states) {
+-        res += state.size();
++        res += state.mem();
+     }
+ 
+-    return res;
++    return res + shadow.mem() + server_pcache_pool_free();
++}
++
++void server_prompt_cache::make_room(const std::function<size_t()> & n_new, const server_prompt_cache_state * keep,
++        const std::function<void()> & on_freed) {
++    if (limit_size == 0) {
++        return;
++    }
++
++    // the state that is about to be loaded leaves the cache right after this call - its size is reclaimable
++    const size_t size_keep = keep ? keep->mem() : 0;
++
++    auto excess = [&]() -> size_t {
++        const size_t tot = size() - size_keep + n_new();
++        return tot > limit_size ? tot - limit_size : 0;
++    };
++
++    // note: never evict `keep` - it is the state that the caller is switching to
++    // [switchcost] free pool blocks go first, then the shadow; dropped / evicted buffers return to the pool, which is
++    // trimmed again before the next state is evicted
++    while (excess() > 0) {
++        if (server_pcache_pool_free() > 0) {
++            server_pcache_pool_trim(excess());
++            continue;
++        }
++        if (shadow_slot >= 0) {
++            SRV_WRN(" - making room for prompt cache entry, dropping the shadow copy (size = %.3f MiB)\n", shadow.mem() / (1024.0 * 1024.0));
++            shadow_drop();
++            on_freed();
++            continue;
++        }
++
++        auto it = states.begin();
++        while (it != states.end() && &*it == keep) {
++            ++it;
++        }
++
++        if (it == states.end()) {
++            break;
++        }
++
++        SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
++                it->size() / (1024.0 * 1024.0));
++
++        states.erase(it);
++        on_freed();
++    }
+ }
+ 
+ size_t server_prompt_cache::n_tokens() const {
+@@ -1708,7 +1998,7 @@ size_t server_prompt_cache::n_tokens() const {
+     return res;
+ }
+ 
+-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_prompt_cache_state * keep) {
++server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, const server_prompt_cache_state * keep, llama_pos ckpt_move_pos) {
+     // first check if the current state is contained fully in the cache
+     for (auto it = states.begin(); it != states.end(); ++it) {
+         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+@@ -1747,38 +2037,41 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         }
+     }
+ 
+-    if (limit_size > 0) {
+-        // the state that is about to be loaded leaves the cache right after this call - its size is reclaimable
+-        const size_t size_keep = keep ? keep->size() : 0;
+-
+-        // make room before allocating the new vectors to avoid breaching the limit
+-        // note: never evict `keep` - it is the state that the caller is switching to
+-        while (size() - size_keep + state_size_new > limit_size) {
+-            auto it = states.begin();
+-            while (it != states.end() && &*it == keep) {
+-                ++it;
+-            }
+-
+-            if (it == states.end()) {
+-                break;
+-            }
++    server_prompt_data state_data;
+ 
+-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+-                    it->size() / (1024.0 * 1024.0));
+-
+-            states.erase(it);
++    // make room before allocating the new buffers to avoid breaching the limit
++    // [switchcost] with the pool, fitting free blocks are taken first (they leave the pool's free bytes and are
++    // counted as part of the new entry); a new block counts with its rounded-up size
++    // blocks freed by an eviction (or the shadow drop) while making room are taken before the pool is trimmed again
++    const bool pool = server_pcache_pool_on();
++    auto try_pool = [&]() {
++        if (!pool) {
++            return;
+         }
+-    }
+-
+-    std::vector<uint8_t> state_data_tgt;
+-    std::vector<uint8_t> state_data_dft;
++        if (state_data.main.size() != state_size_tgt) {
++            state_data.main.alloc_pooled(state_size_tgt);
++        }
++        if (state_data.drft.size() != state_size_dft) {
++            state_data.drft.alloc_pooled(state_size_dft);
++        }
++    };
++    auto n_new = [&]() -> size_t {
++        if (!pool) {
++            return state_size_new;
++        }
++        return checkpoints_size +
++            (state_data.main.size() == state_size_tgt ? state_data.main.mem() : server_pcache_block_size(state_size_tgt)) +
++            (state_data.drft.size() == state_size_dft ? state_data.drft.mem() : server_pcache_block_size(state_size_dft));
++    };
++    try_pool();
++    make_room(n_new, keep, try_pool);
+ 
+     // check if we can allocate enough memory for the new state
+-    try {
+-        state_data_tgt.resize(state_size_tgt);
+-        state_data_dft.resize(state_size_dft);
+-    } catch (const std::bad_alloc & e) {
+-        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
++    if ((state_data.main.size() != state_size_tgt && !state_data.main.alloc(state_size_tgt)) ||
++        (state_data.drft.size() != state_size_dft && !state_data.drft.alloc(state_size_dft))) {
++        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", "std::bad_alloc");
++
++        state_data.release();
+ 
+         limit_size = std::max<size_t>(1, 0.4*size());
+ 
+@@ -1789,15 +2082,25 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         return nullptr;
+     }
+ 
++    // [switchcost] checkpoints with pos_max > ckpt_move_pos are moved (the slot drops them anyway), the rest is copied;
++    // the order is kept
++    std::list<common_prompt_checkpoint> ckpts;
++    for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
++        if (it->pos_max > ckpt_move_pos) {
++            auto cur = it++;
++            ckpts.splice(ckpts.end(), prompt.checkpoints, cur);
++        } else {
++            ckpts.push_back(*it);
++            ++it;
++        }
++    }
++
+     states.push_back({
+         /*.prompt =*/ {
+             /*.tokens      =*/ prompt.tokens.clone(),
+-            /*.checkpoints =*/ prompt.checkpoints,
+-        },
+-        /*.data   =*/ {
+-            /*.main =*/ std::move(state_data_tgt),
+-            /*.drft =*/ std::move(state_data_dft),
++            /*.checkpoints =*/ std::move(ckpts),
+         },
++        /*.data   =*/ std::move(state_data),
+     });
+ 
+     return &states.back();
+@@ -1846,19 +2149,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+     auto it_best = find_better(prompt, tokens_new);
+ 
+     if (it_best != states.end()) {
++        const int64_t sw0 = ggml_time_us(); // [switchcost]
++        int64_t sw1 = sw0;
+         {
+             auto & data = it_best->data.main;
+ 
+             const size_t size = data.size();
+             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
++            sw1 = ggml_time_us();
+             if (n != size) {
+                 SRV_ERR("failed to restore state with size %zu\n", size);
+ 
+                 return false;
+             }
+ 
+-            data.clear();
+-            data.shrink_to_fit();
+         }
+ 
+         {
+@@ -1874,10 +2178,32 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+ 
+                     return false;
+                 }
++            }
++        }
++
++        if (common_swp_on()) {
++            common_swp("restore %d tokens: tgt %.1f MiB %.1f ms, dft %.1f MiB %.1f ms", it_best->prompt.n_tokens(),
++                    it_best->data.main.size() / 1048576.0, (sw1 - sw0) / 1000.0, it_best->data.drft.size() / 1048576.0,
++                    (ggml_time_us() - sw1) / 1000.0);
++        }
+ 
+-                data.clear();
+-                data.shrink_to_fit();
++        // [switchcost] LLAMA_PCACHE_KEEP: keep the restored host copy as the reference of the next save of this slot
++        static const int keep_mode = server_pcache_env("LLAMA_PCACHE_KEEP");
++
++        // LLAMA_PCACHE_KEEP=2: the restored device state, read back in full, must equal the bytes that were loaded
++        if (keep_mode >= 2) {
++            server_pcache_verify_state("restore", ctx_tgt, ctx_dft, id_slot, it_best->data);
++        }
++        if (keep_mode > 0) {
++            shadow_drop();
++            shadow      = std::move(it_best->data);
++            shadow_slot = id_slot;
++            llama_state_seq_ref_mark(ctx_tgt, id_slot);
++            if (ctx_dft && !shadow.drft.empty()) {
++                llama_state_seq_ref_mark(ctx_dft, id_slot);
+             }
++        } else {
++            it_best->data.release();
+         }
+ 
+         SRV_INF(" - restored prompt from cache: %d tokens, %d in common with the new prompt (%d tokens)\n",
+@@ -1893,7 +2219,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+ 
+ void server_prompt_cache::update() {
+     if (limit_size > 0) {
+-        while (!states.empty() && size() > limit_size) {
++        // [switchcost] free pool blocks and the shadow go first; evicted buffers return to the pool (trimmed again)
++        while (size() > limit_size) {
++            if (server_pcache_pool_free() > 0) {
++                server_pcache_pool_trim(size() - limit_size);
++                continue;
++            }
++            if (shadow_slot >= 0) {
++                shadow_drop();
++                continue;
++            }
++            if (states.empty()) {
++                break;
++            }
++
+             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+ 
+             states.pop_front();
+@@ -1918,6 +2257,12 @@ void server_prompt_cache::update() {
+     SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+ 
++    if (common_swp_on()) {
++        common_swp("cache: %zu prompts, %.1f MiB held (shadow %.1f MiB, pool free %.1f MiB), limit %.1f MiB",
++                states.size(), size() / 1048576.0, shadow.mem() / 1048576.0, server_pcache_pool_free() / 1048576.0,
++                limit_size / 1048576.0);
++    }
++
+     for (const auto & state : states) {
+         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index a56a550162..06d2f82fa1 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -7,6 +7,8 @@
+ #include <unordered_set>
+ #include <list>
+ #include <map>
++#include <functional>
++#include <limits>
+ 
+ // TODO: prevent including the whole server-common.h as we only use server_tokens
+ #include "server-common.h"
+@@ -585,13 +587,79 @@ struct server_prompt {
+     }
+ };
+ 
++// [switchcost] switches (all default 0, read once):
++//   LLAMA_PCACHE_POOL=1   prompt-cache state buffers come from a pool of reused pinned (USM host) buffers instead of a
++//                         fresh zero-filled std::vector per save (=2: reused pageable buffers). Pool blocks count
++//                         against --cache-ram like the states themselves and are released first when room is needed.
++//   LLAMA_PCACHE_KEEP=1   the host copy of a state that is restored into a slot is kept (the "shadow"); the next save
++//                         of that slot copies every attention KV row that has not changed since the restore from the
++//                         shadow and reads only the rest from the device (=2: also reads the reused rows and aborts on
++//                         any difference). The shadow counts against --cache-ram and is dropped before any state.
++//   LLAMA_PCACHE_CKPT_MOVE=1  a save moves the slot's checkpoints into the cache entry instead of copying them when
++//                         the slot is about to drop them anyway: all of them when another state is restored right
++//                         after, else those past the common prefix with the new prompt.
++int server_pcache_env(const char * name);
++
++// [switchcost] host buffer of a prompt-cache state: a plain std::vector (default), or a block of the reuse pool
++struct server_state_buf {
++    server_state_buf() = default;
++    server_state_buf(const server_state_buf &) = delete;
++    server_state_buf & operator=(const server_state_buf &) = delete;
++    server_state_buf(server_state_buf && other) noexcept;
++    server_state_buf & operator=(server_state_buf && other) noexcept;
++    ~server_state_buf();
++
++    // allocate n bytes (contents undefined); false when the memory could not be allocated
++    bool alloc(size_t n);
++    // take a free pool block that holds n bytes; false when the pool is off or has none (nothing is allocated)
++    bool alloc_pooled(size_t n);
++    // free the memory (a pool block goes back to the pool)
++    void release();
++
++    uint8_t *       data()       { return ptr; }
++    const uint8_t * data() const { return ptr; }
++    size_t size()  const { return n; }
++    bool   empty() const { return n == 0; }
++    // host memory held
++    size_t mem()   const { return blk ? cap : vec.capacity(); }
++
++private:
++    std::vector<uint8_t> vec;
++    uint8_t * ptr = nullptr;
++    size_t    n   = 0;
++    size_t    cap = 0;
++    void    * blk = nullptr;
++};
++
++// [switchcost] free bytes held by the pool; release pool blocks until at least `n_bytes` are freed (returns freed)
++size_t server_pcache_pool_free();
++bool   server_pcache_pool_on();
++size_t server_pcache_block_size(size_t n);
++size_t server_pcache_pool_trim(size_t n_bytes);
++
++struct server_prompt_data;
++
++// [switchcost] LLAMA_PCACHE_KEEP=2: read the whole state of seq `id` from both contexts and compare it with `data`
++// (aborts on a difference)
++void server_pcache_verify_state(const char * what, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id,
++        const server_prompt_data & data);
++
+ struct server_prompt_data {
+-    std::vector<uint8_t> main;
+-    std::vector<uint8_t> drft;
++    server_state_buf main;
++    server_state_buf drft;
+ 
+     size_t size() const {
+         return main.size() + drft.size();
+     }
++
++    size_t mem() const {
++        return main.mem() + drft.mem();
++    }
++
++    void release() {
++        main.release();
++        drft.release();
++    }
+ };
+ 
+ struct server_prompt_cache_state {
+@@ -607,6 +675,17 @@ struct server_prompt_cache_state {
+ 
+         return res;
+     }
++
++    // host memory held (== size() without the pool)
++    size_t mem() const {
++        size_t res = data.mem();
++
++        for (const auto & ckpt : prompt.checkpoints) {
++            res += ckpt.size();
++        }
++
++        return res;
++    }
+ };
+ 
+ struct server_prompt_cache {
+@@ -623,8 +702,23 @@ struct server_prompt_cache {
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
+ 
++    // [switchcost] LLAMA_PCACHE_KEEP: the host copy of the state last restored into slot shadow_slot (see load())
++    server_prompt_data shadow;
++    int                shadow_slot = -1;
++
++    void shadow_drop() {
++        shadow.release();
++        shadow_slot = -1;
++    }
++
++    // host memory held by the cache: the states, the shadow and the free pool blocks
+     size_t size() const;
+ 
++    // make room for n_new() more bytes: release free pool blocks, then the shadow, then the oldest states (never
++    // `keep`); on_freed() runs after the shadow drop / each eviction, before the pool is trimmed again
++    void make_room(const std::function<size_t()> & n_new, const server_prompt_cache_state * keep,
++            const std::function<void()> & on_freed);
++
+     size_t n_tokens() const;
+ 
+     // find the cached state that would be a better starting point for tokens_new than `prompt`:
+@@ -634,7 +728,9 @@ struct server_prompt_cache {
+ 
+     // `keep` is a cached state that the caller is going to load() right after this call:
+     // it is never evicted to make room and its size counts as reclaimable, since load() removes it from the cache
+-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_prompt_cache_state * keep = nullptr);
++    // [switchcost] checkpoints of `prompt` with pos_max > ckpt_move_pos are moved into the new entry instead of copied
++    // (default: copy all)
++    server_prompt_cache_state * alloc(server_prompt & prompt, size_t state_size_main, size_t state_size_drft, const server_prompt_cache_state * keep = nullptr, llama_pos ckpt_move_pos = std::numeric_limits<llama_pos>::max());
+ 
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
